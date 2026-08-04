@@ -10,6 +10,8 @@ Two contracts, one workspace:
 |---|---|
 | `contracts/market` | The market contract. Source of truth for all funds and rules. |
 | `contracts/mock-lazer` | Testnet-only stand-in for the real `pyth-lazer-stellar` verifier — echoes a payload back unverified so settlement can be exercised end-to-end without real Pyth signatures. **Never deploy to mainnet.** |
+| `contracts/smart-wallet` | A Soroban custom account contract authorized by a WebAuthn passkey (secp256r1) instead of a keypair — lets a passkey-backed address stand in anywhere a normal `Address` is expected, including as the market contract's `user`. |
+| `contracts/smart-wallet-factory` | Deploys + initializes a `smart-wallet` instance in one atomic call, at a deterministic address derived from the passkey's public key. |
 
 ## Why not the original parimutuel design
 
@@ -86,6 +88,32 @@ enum (22 variants) rather than trapping. A failed call still reverts the
 whole transaction — atomicity isn't lost — but callers get a structured
 reason instead of an opaque panic.
 
+## Passkey smart wallets
+
+Rather than requiring a browser extension (Freighter) for every bettor,
+`contracts/smart-wallet` lets a WebAuthn passkey (Face ID / Touch ID /
+Windows Hello / a hardware key) act as the signer for a Soroban `Address`
+directly, via Soroban's account-abstraction `__check_auth` mechanism.
+
+The verification logic — challenge binding via base64url, the
+`sha256(authenticator_data ‖ sha256(client_data_json))` digest construction —
+is adapted from [leighmcculloch/soroban-webauthn](https://github.com/leighmcculloch/soroban-webauthn),
+the reference pattern the Stellar ecosystem uses for this. That repo
+explicitly calls its own code "demo material only... not audited"; the same
+applies here. It's grounded in real, independently-verified cryptography
+(the test suite generates and self-verifies a genuine secp256r1 keypair and
+signature — see `contracts/smart-wallet/src/test.rs` — rather than asserting
+against a stub), but this has not had a professional security review and
+should not hold real value.
+
+One non-obvious thing the test suite caught empirically: Soroban's
+`secp256r1_verify` **rejects high-S signatures**. A signature generated
+without normalizing `s` to the curve's lower half verified fine locally
+(plain ECDSA doesn't care about S's sign) but was rejected by the Soroban
+host — the frontend's WebAuthn signing code has to replicate this
+normalization (`s' = n - s` when `s > n/2`) on every real browser assertion,
+not just this test's synthetic one.
+
 ## Feed ID
 
 `feed_id` is an `initialize` parameter, not hardcoded. For this build it
@@ -112,6 +140,8 @@ track whatever hash is actually uploaded):
 |---|---|---|
 | `polaris_market.wasm` | 43,368 bytes | `f2876facb1c3d0fddc68c0baca23f365fa7e77e8ef3903acb1f1d1d97f66e314` |
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
+| `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
+| `polaris_smart_wallet_factory.wasm` | 4,039 bytes | `2cad3757214adeccd89ad241eb0b30a1d7e92a92a9c27a2b3f7de2874ed7c0ed` |
 
 ## Deploying (needs the Stellar CLI, not available in this build environment)
 
