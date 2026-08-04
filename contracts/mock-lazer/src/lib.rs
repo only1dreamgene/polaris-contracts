@@ -23,3 +23,18 @@ impl MockLazer {
         data
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::Env;
+
+    #[test]
+    fn echoes_payload_unchanged() {
+        let env = Env::default();
+        let id = env.register(MockLazer, ());
+        let client = MockLazerClient::new(&env, &id);
+        let data = Bytes::from_slice(&env, &[1, 2, 3, 4, 5]);
+        assert_eq!(client.verify_update(&data), data);
+    }
+}
