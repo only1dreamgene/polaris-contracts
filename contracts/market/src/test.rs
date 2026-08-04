@@ -1,0 +1,504 @@
+#![cfg(test)]
+extern crate std;
+
+use super::*;
+use soroban_sdk::testutils::{Address as _, Ledger};
+use soroban_sdk::{token, Address, Env};
+
+/// Wire-format payload matching pyth-lazer-stellar-sdk's parser: magic(4) +
+/// timestamp(8, LE µs) + channel(1) + num_feeds(1) + [feed_id(4) +
+/// num_props(1) + properties...]. We only encode price(0), exponent(4), and
+/// feed_update_timestamp(12) — the three properties `settle` reads.
+fn build_payload(feed_id: u32, price: i64, exponent: i16, feed_ts_micros: u64) -> std::vec::Vec<u8> {
+    let mut b = std::vec::Vec::new();
+    b.extend_from_slice(&2_479_346_549u32.to_le_bytes()); // magic
+    b.extend_from_slice(&feed_ts_micros.to_le_bytes()); // top-level timestamp
+    b.push(3); // channel = FixedRate200ms
+    b.push(1); // num_feeds
+    b.extend_from_slice(&feed_id.to_le_bytes());
+    b.push(3); // num_properties
+    b.push(0); // property: price
+    b.extend_from_slice(&(price as u64).to_le_bytes());
+    b.push(4); // property: exponent
+    b.extend_from_slice(&(exponent as u16).to_le_bytes());
+    b.push(12); // property: feed_update_timestamp
+    b.push(1); // exists = true
+    b.extend_from_slice(&feed_ts_micros.to_le_bytes());
+    b
+}
+
+const FEED_ID: u32 = 100; // XLM/USD, testnet placeholder
+const DAY: u64 = 86_400;
+
+struct Harness {
+    env: Env,
+    market_id: Address,
+    lazer_id: Address,
+    token_id: Address,
+    admin: Address,
+    treasury: Address,
+    expiry: u64,
+    grace: u64,
+}
+
+fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_id = sac.address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_id);
+
+    let lazer_id = env.register(mock_lazer::MockLazer, ());
+    let market_id = env.register(PolarisMarket, ());
+
+    let expiry = env.ledger().timestamp() + DAY;
+    let grace = 3_600u64;
+
+    token_admin.mint(&admin, &(initial_liquidity * 1000));
+
+    let client = PolarisMarketClient::new(&env, &market_id);
+    client.initialize(
+        &admin,
+        &token_id,
+        &strike_cents,
+        &expiry,
+        &grace,
+        &lazer_id,
+        &FEED_ID,
+        &100u32, // 1% fee
+        &treasury,
+        &initial_liquidity,
+    );
+
+    Harness {
+        env,
+        market_id,
+        lazer_id,
+        token_id,
+        admin,
+        treasury,
+        expiry,
+        grace,
+    }
+}
+
+fn fund(h: &Harness, who: &Address, amount: i128) {
+    token::StellarAssetClient::new(&h.env, &h.token_id).mint(who, &amount);
+}
+
+mod mock_lazer {
+    // Re-declare the mock verifier inline so the market crate's tests don't
+    // need a path dependency on the sibling crate.
+    use soroban_sdk::{contract, contractimpl, Bytes, Env};
+
+    #[contract]
+    pub struct MockLazer;
+
+    #[contractimpl]
+    impl MockLazer {
+        pub fn verify_update(_env: Env, data: Bytes) -> Bytes {
+            data
+        }
+    }
+}
+
+// ---------- initialize ----------
+
+#[test]
+fn init_rejects_bad_params() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_id = sac.address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &1_000_000);
+    let lazer_id = env.register(mock_lazer::MockLazer, ());
+    let expiry = env.ledger().timestamp() + DAY;
+
+    let bad_strike = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &bad_strike);
+    assert_eq!(
+        c.try_initialize(&admin, &token_id, &0i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &treasury, &1000i128),
+        Err(Ok(Error::InvalidStrikePrice))
+    );
+
+    let bad_expiry = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &bad_expiry);
+    assert_eq!(
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &1u64, &3600u64, &lazer_id, &FEED_ID, &100u32, &treasury, &1000i128),
+        Err(Ok(Error::InvalidExpiry))
+    );
+
+    let bad_fee = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &bad_fee);
+    assert_eq!(
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &1001u32, &treasury, &1000i128),
+        Err(Ok(Error::InvalidFeeBps))
+    );
+}
+
+#[test]
+fn init_seeds_pool_and_pulls_liquidity() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let m = client.get_market();
+    assert_eq!(m.pool_yes, 10_000);
+    assert_eq!(m.pool_no, 10_000);
+    assert_eq!(m.total_supply, 10_000);
+    assert_eq!(
+        token::Client::new(&h.env, &h.token_id).balance(&h.market_id),
+        10_000
+    );
+    let (yes_bps, no_bps) = client.get_price();
+    assert_eq!(yes_bps, 5_000);
+    assert_eq!(no_bps, 5_000);
+}
+
+#[test]
+fn double_initialize_rejected() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let res = client.try_initialize(
+        &h.admin, &h.token_id, &1_000_000i128, &h.expiry, &h.grace, &h.lazer_id,
+        &FEED_ID, &100u32, &h.treasury, &10_000i128,
+    );
+    assert_eq!(res, Err(Ok(Error::AlreadyInitialized)));
+}
+
+// ---------- split / merge ----------
+
+#[test]
+fn split_then_merge_round_trips_collateral() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    client.split(&user, &2_000);
+    assert_eq!(client.get_position(&user), (2_000, 2_000));
+    assert_eq!(
+        token::Client::new(&h.env, &h.token_id).balance(&user),
+        3_000
+    );
+
+    client.merge(&user, &2_000);
+    assert_eq!(client.get_position(&user), (0, 0));
+    assert_eq!(
+        token::Client::new(&h.env, &h.token_id).balance(&user),
+        5_000
+    );
+
+    assert_solvent(&h);
+}
+
+#[test]
+fn merge_more_than_held_rejected() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.split(&user, &1_000);
+    assert_eq!(
+        client.try_merge(&user, &2_000),
+        Err(Ok(Error::InsufficientBalance))
+    );
+}
+
+// ---------- buy / sell (AMM) ----------
+
+#[test]
+fn buy_yes_moves_price_up_and_costs_more_than_split_alone() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    let total_yes = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    // buyer should receive MORE than 1,000 YES shares (bonus from the swap)
+    assert!(total_yes > 1_000, "expected AMM bonus, got {total_yes}");
+    assert_eq!(client.get_position(&user), (total_yes, 0));
+
+    let (yes_bps, no_bps) = client.get_price();
+    assert!(yes_bps > 5_000, "YES should now be more expensive: {yes_bps}");
+    assert_eq!(yes_bps + no_bps, 10_000);
+
+    assert_solvent(&h);
+}
+
+#[test]
+fn buy_respects_slippage_floor() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let res = client.try_buy(&user, &Prediction::Yes, &1_000, &1_000_000_000);
+    assert_eq!(res, Err(Ok(Error::SlippageExceeded)));
+}
+
+#[test]
+fn buy_then_sell_returns_close_to_original_minus_fees() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let collateral_back = client.sell(&user, &Prediction::Yes, &shares, &0);
+
+    // round-trip with two fee/slippage-bearing trades must return strictly
+    // less than staked, but shouldn't be devastating for a 10%-of-pool trade
+    assert!(collateral_back < 1_000);
+    assert!(collateral_back > 800, "got {collateral_back}");
+
+    assert_solvent(&h);
+}
+
+#[test]
+fn sell_full_one_sided_position_returns_nonzero_collateral() {
+    // Regression: a naive "swap to opposite side then merge" sell returns
+    // ZERO when the seller's entire prediction-side balance is swapped away
+    // (they end up on the pure opposite side with nothing left to merge).
+    // The closed-form FPMM sell must not have this failure mode.
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    assert_eq!(client.get_position(&user), (shares, 0)); // pure one-sided position
+
+    let collateral_back = client.sell(&user, &Prediction::Yes, &shares, &0);
+    assert!(collateral_back > 0, "sell of a full one-sided position returned zero");
+    assert_eq!(client.get_position(&user), (0, 0));
+
+    assert_solvent(&h);
+}
+
+#[test]
+fn buy_after_expiry_rejected() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    h.env.ledger().set_timestamp(h.expiry);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let res = client.try_buy(&user, &Prediction::Yes, &1_000, &0);
+    assert_eq!(res, Err(Ok(Error::TradingClosed)));
+}
+
+// ---------- transfer ----------
+
+#[test]
+fn transfer_moves_shares_between_addresses() {
+    let h = setup(1_000_000, 10_000);
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    fund(&h, &alice, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    client.split(&alice, &1_000);
+    client.transfer(&alice, &bob, &Prediction::Yes, &400);
+
+    assert_eq!(client.get_position(&alice), (600, 1_000));
+    assert_eq!(client.get_position(&bob), (400, 0));
+    assert_solvent(&h);
+}
+
+#[test]
+fn transfer_insufficient_balance_rejected() {
+    let h = setup(1_000_000, 10_000);
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let res = client.try_transfer(&alice, &bob, &Prediction::Yes, &1);
+    assert_eq!(res, Err(Ok(Error::InsufficientBalance)));
+}
+
+// ---------- settle ----------
+
+#[test]
+fn settle_before_expiry_rejected() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let payload = build_payload(FEED_ID, 60_000_00000000, -8, h.env.ledger().timestamp() as u64 * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::ExpiryNotReached)));
+}
+
+#[test]
+fn settle_yes_wins_on_price_at_or_above_strike() {
+    let h = setup(1_000_000, 10_000); // strike = $10,000.00
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+
+    h.env.ledger().set_timestamp(h.expiry);
+    // price exactly at strike: $10,000.00 == 1_000_000_000_00 * 10^-8
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    client.settle(&bytes);
+
+    let m = client.get_market();
+    assert_eq!(m.status, MarketStatus::ResolvedYes); // inclusive >= rule
+    assert_eq!(m.final_price, 1_000_000);
+
+    let before = token::Client::new(&h.env, &h.token_id).balance(&user);
+    let payout = client.redeem(&user);
+    assert_eq!(payout, shares);
+    let after = token::Client::new(&h.env, &h.token_id).balance(&user);
+    assert_eq!(after - before, shares);
+
+    assert_solvent(&h);
+}
+
+#[test]
+fn settle_no_wins_below_strike_and_yes_side_gets_nothing() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 9_999_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    client.settle(&bytes);
+
+    let m = client.get_market();
+    assert_eq!(m.status, MarketStatus::ResolvedNo);
+
+    let res = client.try_redeem(&user);
+    assert_eq!(res, Err(Ok(Error::NothingToRedeem)));
+    let _ = shares;
+    assert_solvent(&h);
+}
+
+#[test]
+fn settle_rejects_stale_price() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let stale_ts = (h.expiry - 1_000) * 1_000_000; // > 5 min before expiry
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, stale_ts);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::StalePrice)));
+}
+
+#[test]
+fn settle_rejects_wrong_feed_id() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID + 1, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::FeedNotFound)));
+}
+
+#[test]
+fn double_settle_rejected() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    client.settle(&bytes);
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::AlreadyFinalized)));
+}
+
+// ---------- cancel (liveness backstop) ----------
+
+#[test]
+fn cancel_before_grace_elapsed_rejected() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let res = client.try_cancel();
+    assert_eq!(res, Err(Ok(Error::GracePeriodNotElapsed)));
+}
+
+#[test]
+fn cancel_after_grace_refunds_both_sides_at_par() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.split(&user, &1_000); // simplest case: matched pair, no swap
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace);
+    client.cancel();
+
+    let m = client.get_market();
+    assert_eq!(m.status, MarketStatus::Cancelled);
+
+    let before = token::Client::new(&h.env, &h.token_id).balance(&user);
+    let payout = client.redeem(&user);
+    assert_eq!(payout, 2_000); // 1000 YES + 1000 NO, both at par
+    let after = token::Client::new(&h.env, &h.token_id).balance(&user);
+    assert_eq!(after - before, 2_000);
+
+    assert_solvent(&h);
+}
+
+#[test]
+fn cancel_refunds_directional_bettor_fully_even_with_no_counterparty() {
+    // The scenario the original parimutuel design special-cased ("empty
+    // winning pool"): a single bettor takes a directional position and the
+    // oracle never resolves. Because they're actually holding a CTF share
+    // backed 1:1 by locked collateral (not a parimutuel claim on a shared
+    // pool), a full refund falls out of `cancel` + `redeem` with no special
+    // casing at all.
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace);
+    client.cancel();
+    let payout = client.redeem(&user);
+    assert_eq!(payout, shares);
+
+    assert_solvent(&h);
+}
+
+// ---------- fee bounded ----------
+
+#[test]
+fn fee_only_taken_on_swaps_never_on_split_merge_or_cancel() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    client.split(&user, &1_000);
+    client.merge(&user, &1_000);
+    // split+merge round-trip returns exactly what was put in, no fee skimmed
+    assert_eq!(
+        token::Client::new(&h.env, &h.token_id).balance(&user),
+        5_000
+    );
+    assert_solvent(&h);
+}
+
+// ---------- global solvency invariant ----------
+
+fn assert_solvent(h: &Harness) {
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let m = client.get_market();
+    let bal = token::Client::new(&h.env, &h.token_id).balance(&h.market_id);
+    assert_eq!(
+        bal, m.total_supply as i128,
+        "collateral balance must always equal total_supply"
+    );
+}

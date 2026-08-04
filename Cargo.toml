@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["contracts/*"]
+
+[workspace.dependencies]
+soroban-sdk = "26.1.0"
+pyth-lazer-stellar-sdk = "0.3"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+[profile.release-with-logs]
+inherits = "release"
+debug-assertions = true
