@@ -70,7 +70,8 @@ fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
         &grace,
         &lazer_id,
         &FEED_ID,
-        &100u32, // 1% fee
+        &100u32, // base fee: 1%
+        &20u32,  // min fee: 0.2%
         &treasury,
         &initial_liquidity,
     );
@@ -125,22 +126,30 @@ fn init_rejects_bad_params() {
     let bad_strike = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &bad_strike);
     assert_eq!(
-        c.try_initialize(&admin, &token_id, &0i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &treasury, &1000i128),
+        c.try_initialize(&admin, &token_id, &0i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128),
         Err(Ok(Error::InvalidStrikePrice))
     );
 
     let bad_expiry = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &bad_expiry);
     assert_eq!(
-        c.try_initialize(&admin, &token_id, &6_000_000i128, &1u64, &3600u64, &lazer_id, &FEED_ID, &100u32, &treasury, &1000i128),
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &1u64, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128),
         Err(Ok(Error::InvalidExpiry))
     );
 
     let bad_fee = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &bad_fee);
     assert_eq!(
-        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &1001u32, &treasury, &1000i128),
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &1001u32, &20u32, &treasury, &1000i128),
         Err(Ok(Error::InvalidFeeBps))
+    );
+
+    let bad_fee_range = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &bad_fee_range);
+    assert_eq!(
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &50u32, &100u32, &treasury, &1000i128),
+        Err(Ok(Error::InvalidFeeBps)),
+        "min_fee_bps > base_fee_bps must be rejected"
     );
 }
 
@@ -167,7 +176,7 @@ fn double_initialize_rejected() {
     let client = PolarisMarketClient::new(&h.env, &h.market_id);
     let res = client.try_initialize(
         &h.admin, &h.token_id, &1_000_000i128, &h.expiry, &h.grace, &h.lazer_id,
-        &FEED_ID, &100u32, &h.treasury, &10_000i128,
+        &FEED_ID, &100u32, &20u32, &h.treasury, &10_000i128,
     );
     assert_eq!(res, Err(Ok(Error::AlreadyInitialized)));
 }
@@ -488,6 +497,51 @@ fn fee_only_taken_on_swaps_never_on_split_merge_or_cancel() {
         token::Client::new(&h.env, &h.token_id).balance(&user),
         5_000
     );
+    assert_solvent(&h);
+}
+
+// ---------- fee curve ----------
+
+#[test]
+fn fee_starts_at_base_and_decays_toward_min_as_volume_grows() {
+    let h = setup(1_000_000, 10_000); // base=100 (1%), min=20 (0.2%), seeded at 10_000
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000);
+
+    // Fresh market: total_supply == initial_liquidity, fee == base exactly.
+    assert_eq!(client.get_fee(), 100);
+
+    // Split alone grows total_supply without any swap — enough on its own
+    // to move the curve, independent of buy/sell behavior.
+    client.split(&user, &10_000); // total_supply: 10_000 -> 20_000, doubled
+    assert_eq!(client.get_fee(), 60); // 20 + (100-20)*10_000/20_000 = 20+40 = 60
+
+    client.split(&user, &30_000); // total_supply: 20_000 -> 50_000 (5x seed)
+    assert_eq!(client.get_fee(), 36); // 20 + 80*10_000/50_000 = 20+16 = 36
+
+    // As total_supply grows without bound, fee strictly decreases and never
+    // drops below min_fee_bps.
+    client.split(&user, &950_000); // total_supply: 50_000 -> 1_000_000 (100x seed)
+    let fee_at_100x = client.get_fee();
+    assert!(fee_at_100x < 36 && fee_at_100x >= 20, "got {fee_at_100x}");
+
+    assert_solvent(&h);
+}
+
+#[test]
+fn fee_never_exceeds_base_even_if_total_supply_dips_back_toward_seed() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 100_000);
+
+    client.split(&user, &40_000); // total_supply: 10_000 -> 50_000, fee compresses
+    assert!(client.get_fee() < 100);
+
+    client.merge(&user, &40_000); // back down to exactly initial_liquidity
+    assert_eq!(client.get_fee(), 100); // curve is a pure function of current total_supply, not a ratchet
+
     assert_solvent(&h);
 }
 

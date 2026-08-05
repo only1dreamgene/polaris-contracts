@@ -105,13 +105,15 @@ pub struct Market {
     pub grace_period: u64,
     pub lazer_contract: Address,
     pub feed_id: u32,
-    pub fee_bps: u32,
+    pub base_fee_bps: u32, // swap fee charged when total_supply == initial_liquidity (no volume yet)
+    pub min_fee_bps: u32,  // swap fee approached as total_supply grows without bound
     pub treasury: Address,
     pub status: MarketStatus,
     pub final_price: i128, // cents; 0 until resolved
     pub pool_yes: i128,    // AMM reserve; 0 once trading has ended
     pub pool_no: i128,
     pub total_supply: i128, // == total YES outstanding == total NO outstanding, pre-resolution
+    pub initial_liquidity: i128, // immutable reference scale for the fee curve; total_supply >= this always, pre-resolution
 }
 
 #[derive(Clone)]
@@ -224,6 +226,26 @@ fn apply_fee(amount: i128, fee_bps: u32) -> i128 {
     amount - fee
 }
 
+/// Cost-driven fee curve: `base_fee_bps` at zero volume (`total_supply ==
+/// initial_liquidity`), decaying toward `min_fee_bps` as `total_supply`
+/// grows — the same "the more it's used, the cheaper it gets" shape as a
+/// marginal-cost-based repricing curve, computed automatically per trade
+/// rather than set by hand.
+///
+/// `effective = min + (base - min) * initial_liquidity / total_supply`.
+/// Well-defined and bounded to `[min_fee_bps, base_fee_bps]` because
+/// `total_supply >= initial_liquidity` is a standing invariant while a
+/// market is Open (every `merge`/`sell`/`redeem` can only unwind collateral
+/// that `split`/`buy` actually locked; the admin's own seed liquidity is
+/// never itself withdrawable pre-resolution — see the pool-to-treasury
+/// credit in `settle`/`cancel`), so the ratio is always in `(0, 1]`.
+fn effective_fee_bps(m: &Market) -> u32 {
+    let base = m.base_fee_bps as i128;
+    let min = m.min_fee_bps as i128;
+    let scaled = min + (base - min) * m.initial_liquidity / m.total_supply;
+    scaled as u32
+}
+
 /// Converts a Pyth raw price (`price * 10^exponent` = USD) into integer
 /// cents (`USD * 100`), staying in integer math throughout.
 fn to_cents(price: i64, exponent: i16) -> i128 {
@@ -265,7 +287,8 @@ impl PolarisMarket {
         grace_period: u64,
         lazer_contract: Address,
         feed_id: u32,
-        fee_bps: u32,
+        base_fee_bps: u32,
+        min_fee_bps: u32,
         treasury: Address,
         initial_liquidity: i128,
     ) -> Result<(), Error> {
@@ -286,7 +309,7 @@ impl PolarisMarket {
         if feed_id == 0 {
             return Err(Error::InvalidFeedId);
         }
-        if fee_bps > MAX_FEE_BPS {
+        if base_fee_bps > MAX_FEE_BPS || min_fee_bps > base_fee_bps {
             return Err(Error::InvalidFeeBps);
         }
         if initial_liquidity <= 0 {
@@ -307,13 +330,15 @@ impl PolarisMarket {
             grace_period,
             lazer_contract,
             feed_id,
-            fee_bps,
+            base_fee_bps,
+            min_fee_bps,
             treasury,
             status: MarketStatus::Open,
             final_price: 0,
             pool_yes: initial_liquidity,
             pool_no: initial_liquidity,
             total_supply: initial_liquidity,
+            initial_liquidity,
         };
         save_market(&env, &market);
         env.events().publish(
@@ -397,7 +422,7 @@ impl PolarisMarket {
 
         let unwanted = prediction.other();
         let (reserve_in, reserve_out) = reserves(&m, unwanted);
-        let effective_in = apply_fee(collateral_amount, m.fee_bps);
+        let effective_in = apply_fee(collateral_amount, effective_fee_bps(&m));
         let amount_out = cpmm_out(reserve_in, reserve_out, effective_in);
         if amount_out < min_shares_out {
             return Err(Error::SlippageExceeded);
@@ -452,7 +477,7 @@ impl PolarisMarket {
 
         let opposite = prediction.other();
         let (reserve_in, reserve_out) = reserves(&m, prediction);
-        let effective_in = apply_fee(shares_in, m.fee_bps);
+        let effective_in = apply_fee(shares_in, effective_fee_bps(&m));
         let collateral_out = cpmm_sell_out(reserve_in, reserve_out, effective_in);
         if collateral_out <= 0 || collateral_out < min_collateral_out {
             return Err(Error::SlippageExceeded);
@@ -639,6 +664,16 @@ impl PolarisMarket {
         let total = m.pool_yes + m.pool_no;
         let yes_bps = (m.pool_no * 10_000 / total) as u32;
         Ok((yes_bps, 10_000 - yes_bps))
+    }
+
+    /// Current swap fee (bps), per the volume-scaled curve in `effective_fee_bps` —
+    /// `base_fee_bps` when the market is fresh, decaying toward `min_fee_bps`
+    /// as `total_supply` grows. Authoritative source for what `buy`/`sell`
+    /// will actually charge right now; callers shouldn't recompute the curve
+    /// themselves against a possibly-stale `total_supply` read elsewhere.
+    pub fn get_fee(env: Env) -> Result<u32, Error> {
+        let m = load_market(&env)?;
+        Ok(effective_fee_bps(&m))
     }
 }
 

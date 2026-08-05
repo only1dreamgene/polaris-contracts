@@ -88,6 +88,24 @@ enum (22 variants) rather than trapping. A failed call still reverts the
 whole transaction — atomicity isn't lost — but callers get a structured
 reason instead of an opaque panic.
 
+## Cost-driven fee curve
+
+The swap fee isn't a flat admin-set constant — it's computed per-trade from
+a curve: `effective_fee_bps = min_fee_bps + (base_fee_bps - min_fee_bps) *
+initial_liquidity / total_supply` (see `effective_fee_bps` in
+`contracts/market/src/lib.rs`). A fresh market charges `base_fee_bps`; as
+`total_supply` grows (more collateral locked via `split`/`buy`), the fee
+compresses toward `min_fee_bps` automatically — the same "cost falls as
+scale grows, and the price passes that through automatically" shape as
+e.g. dynamic supercharger pricing, rather than a number an admin has to
+notice and go reprice by hand. It's well-defined and bounded to
+`[min_fee_bps, base_fee_bps]` because `total_supply >= initial_liquidity`
+is a standing invariant while a market is Open — the admin's own seed
+liquidity is never itself withdrawable pre-resolution, so the ratio driving
+the curve is always in `(0, 1]`. Query the current value with `get_fee()`
+rather than recomputing it against a possibly-stale `total_supply` read
+elsewhere.
+
 ## Passkey smart wallets
 
 Rather than requiring a browser extension (Freighter) for every bettor,
@@ -138,7 +156,7 @@ track whatever hash is actually uploaded):
 
 | Contract | Size | SHA-256 |
 |---|---|---|
-| `polaris_market.wasm` | 43,368 bytes | `f2876facb1c3d0fddc68c0baca23f365fa7e77e8ef3903acb1f1d1d97f66e314` |
+| `polaris_market.wasm` | 44,910 bytes | `36210bc2233352b7b1c339fc26df30856829361966b04f455396ee144df85b90` |
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
 | `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
 | `polaris_smart_wallet_factory.wasm` | 4,039 bytes | `2cad3757214adeccd89ad241eb0b30a1d7e92a92a9c27a2b3f7de2874ed7c0ed` |
@@ -151,5 +169,6 @@ stellar contract deploy --wasm target/wasm32v1-none/release/polaris_market.wasm 
 stellar contract invoke --id <CONTRACT_ID> --source deployer --network testnet -- \
   initialize --admin <ADMIN> --collateral <XLM_SAC> --strike_price 1500000 \
   --expiry <UNIX_TS> --grace_period 3600 --lazer_contract <LAZER_ID> \
-  --feed_id 100 --fee_bps 100 --treasury <TREASURY> --initial_liquidity 10000000000
+  --feed_id 100 --base_fee_bps 100 --min_fee_bps 20 \
+  --treasury <TREASURY> --initial_liquidity 10000000000
 ```
