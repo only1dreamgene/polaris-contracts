@@ -18,23 +18,33 @@ fn sample_pk(env: &Env, tag: u8) -> BytesN<65> {
 }
 
 #[test]
-fn deploy_produces_the_precomputed_deterministic_address() {
+fn resolve_matches_what_deploy_actually_produces() {
     let env = Env::default();
     env.mock_all_auths();
     let factory_id = env.register(SmartWalletFactory, ());
     let wasm_hash = env.deployer().upload_contract_wasm(SMART_WALLET_WASM);
     let pk = sample_pk(&env, 1);
-
-    // Independently compute what address *should* result, the same way a
-    // frontend or backend would to avoid an on-chain lookup after deploy.
-    let salt = env.crypto().sha256(&pk.clone().into());
-    let expected_address = env
-        .as_contract(&factory_id, || env.deployer().with_current_contract(salt).deployed_address());
-
     let client = SmartWalletFactoryClient::new(&env, &factory_id);
-    let deployed_address = client.deploy(&pk, &wasm_hash);
 
-    assert_eq!(deployed_address, expected_address);
+    // resolve() is a pure computation with no deployment — check it against
+    // itself for idempotency, then against the real deployed address.
+    let resolved_before = client.resolve(&pk);
+    let deployed_address = client.deploy(&pk, &wasm_hash);
+    let resolved_after = client.resolve(&pk);
+
+    assert_eq!(resolved_before, deployed_address);
+    assert_eq!(resolved_after, deployed_address);
+}
+
+#[test]
+fn resolve_differs_for_different_keys() {
+    let env = Env::default();
+    let factory_id = env.register(SmartWalletFactory, ());
+    let client = SmartWalletFactoryClient::new(&env, &factory_id);
+
+    let addr1 = client.resolve(&sample_pk(&env, 1));
+    let addr2 = client.resolve(&sample_pk(&env, 2));
+    assert_ne!(addr1, addr2);
 }
 
 #[test]

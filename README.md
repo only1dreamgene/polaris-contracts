@@ -132,6 +132,18 @@ host — the frontend's WebAuthn signing code has to replicate this
 normalization (`s' = n - s` when `s > n/2`) on every real browser assertion,
 not just this test's synthetic one.
 
+### Portable identity
+
+Because a wallet's address is `deploy()`'s deterministic function of
+`sha256(public_key)`, the *same* passkey resolves to the *same* Soroban
+address regardless of which frontend calls the factory — `resolve(public_key)`
+computes that address without deploying anything, so a caller can check
+whether a wallet already exists before prompting a "create wallet" flow.
+That determinism is what makes a passkey issued on one site usable as a
+sign-in credential anywhere else that talks to the same factory instance —
+see `polaris-oracle`'s `GET /wallets/resolve` and the embeddable widget for
+where this actually gets used, not just left as a latent property.
+
 ## Feed ID
 
 `feed_id` is an `initialize` parameter, not hardcoded. For this build it
@@ -159,7 +171,7 @@ track whatever hash is actually uploaded):
 | `polaris_market.wasm` | 44,910 bytes | `36210bc2233352b7b1c339fc26df30856829361966b04f455396ee144df85b90` |
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
 | `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
-| `polaris_smart_wallet_factory.wasm` | 4,039 bytes | `2cad3757214adeccd89ad241eb0b30a1d7e92a92a9c27a2b3f7de2874ed7c0ed` |
+| `polaris_smart_wallet_factory.wasm` | 4,536 bytes | `12afe5fec43db2f30b75616589284a73acb71724446ff002fc2ff66423990c91` |
 
 ## Deploying (needs the Stellar CLI, not available in this build environment)
 
