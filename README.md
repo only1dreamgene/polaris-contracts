@@ -81,10 +81,27 @@ winning side — there's no "empty winning pool" branch to write or test,
 because the invariant makes it structurally impossible. `assert_solvent()`
 in the test suite checks this after every test.
 
+## Pool-depth guard
+
+`buy`/`sell` reject a trade outright (`Error::PoolDepthExceeded`) if it
+would consume half or more of the reserve it's drawing from. This isn't
+slippage protection — `min_shares_out`/`min_collateral_out` already cover
+that, and a caller can set those to `0` if they want to. It's a correctness
+fix for integer floor division: `cpmm_out`'s `k / new_reserve_in` can floor
+hard enough that a large-but-entirely-plausible trade against a shallow
+pool claims nearly the *entire* opposite reserve. Confirmed empirically,
+not just reasoned about — a single 10.1 XLM buy against a 10,000-stroop
+seeded pool drained it from 10,000 down to 1 before this guard existed (see
+`buy_large_enough_to_exhaust_a_reserve_is_rejected` in
+`contracts/market/src/test.rs`). The 50% cap is deliberately generous
+(modeled on the same kind of per-trade concentration cap Balancer uses on
+its weighted pools) — it exists to rule out the *pathological* case, not to
+throttle ordinary large trades against a reasonably deep pool.
+
 ## Errors, not panics
 
 Every entrypoint returns `Result<T, Error>` with a typed `#[contracterror]`
-enum (22 variants) rather than trapping. A failed call still reverts the
+enum (23 variants) rather than trapping. A failed call still reverts the
 whole transaction — atomicity isn't lost — but callers get a structured
 reason instead of an opaque panic.
 
@@ -168,7 +185,7 @@ track whatever hash is actually uploaded):
 
 | Contract | Size | SHA-256 |
 |---|---|---|
-| `polaris_market.wasm` | 44,910 bytes | `36210bc2233352b7b1c339fc26df30856829361966b04f455396ee144df85b90` |
+| `polaris_market.wasm` | 45,343 bytes | `47908f07ad2088479e549ab6bf2b1e2577b18997b70ea57e5cc34c085c0bc0fb` |
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
 | `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
 | `polaris_smart_wallet_factory.wasm` | 4,536 bytes | `12afe5fec43db2f30b75616589284a73acb71724446ff002fc2ff66423990c91` |

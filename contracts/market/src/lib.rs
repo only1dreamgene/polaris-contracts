@@ -68,6 +68,11 @@ pub enum Error {
     AlreadyFinalized = 20,
     NotFinalized = 21,
     NothingToRedeem = 22,
+    /// A trade would consume an entire AMM reserve (or, due to integer
+    /// floor division, all but a negligible remainder of it) — rejected
+    /// outright rather than letting a reserve hit nearly zero and permanently
+    /// break that side's pricing. See `buy`/`sell`'s pool-depth guard.
+    PoolDepthExceeded = 23,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -424,6 +429,16 @@ impl PolarisMarket {
         let (reserve_in, reserve_out) = reserves(&m, unwanted);
         let effective_in = apply_fee(collateral_amount, effective_fee_bps(&m));
         let amount_out = cpmm_out(reserve_in, reserve_out, effective_in);
+        // Cap single-trade impact to half the reserve being drawn from. Not
+        // just a slippage nicety: cpmm_out's integer floor division lets a
+        // large enough trade against a shallow pool claim nearly the whole
+        // reserve — a 10.1 XLM buy against a 10_000-stroop seeded pool once
+        // drained it from 10_000 down to 1 in this build's own test suite.
+        // `min_shares_out` doesn't catch this (the caller can set it to 0,
+        // and did, by default); the contract needs its own floor.
+        if amount_out * 2 >= reserve_out {
+            return Err(Error::PoolDepthExceeded);
+        }
         if amount_out < min_shares_out {
             return Err(Error::SlippageExceeded);
         }
@@ -479,6 +494,13 @@ impl PolarisMarket {
         let (reserve_in, reserve_out) = reserves(&m, prediction);
         let effective_in = apply_fee(shares_in, effective_fee_bps(&m));
         let collateral_out = cpmm_sell_out(reserve_in, reserve_out, effective_in);
+        // Same reserve-depth cap as `buy`, against the same reserve
+        // (`reserve_out`, the opposite side's pool — the one this trade only
+        // ever *decreases*, unlike `reserve_in` which is inflated by
+        // `shares_in` first and so has more headroom).
+        if collateral_out * 2 >= reserve_out {
+            return Err(Error::PoolDepthExceeded);
+        }
         if collateral_out <= 0 || collateral_out < min_collateral_out {
             return Err(Error::SlippageExceeded);
         }

@@ -556,3 +556,61 @@ fn assert_solvent(h: &Harness) {
         "collateral balance must always equal total_supply"
     );
 }
+
+// ---------- pool-depth guard ----------
+
+#[test]
+fn buy_large_enough_to_exhaust_a_reserve_is_rejected() {
+    // Integer floor division in cpmm_out means, for a big enough trade
+    // against a shallow pool, `new_reserve_out` can floor all the way to 0
+    // — reserve_out - 0 = reserve_out, so the trade would claim the ENTIRE
+    // opposite reserve. Confirmed empirically before this guard existed: a
+    // single 101_000_000-stroop (10.1 XLM) buy against this exact
+    // 10_000-stroop seeded pool drained pool_yes from 10_000 down to 1.
+    // That's not a whale-only exploit — it's a plausible trade size against
+    // a modest (or organically lopsided) pool. `buy`/`sell` must reject
+    // outright rather than let a reserve get driven to (near-)zero.
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000_000);
+
+    let res = client.try_buy(&user, &Prediction::Yes, &101_000_000, &0);
+    assert_eq!(res, Err(Ok(Error::PoolDepthExceeded)));
+
+    // Rejected means rejected — no state change at all.
+    let m = client.get_market();
+    assert_eq!(m.pool_yes, 10_000);
+    assert_eq!(m.pool_no, 10_000);
+    assert_solvent(&h);
+}
+
+#[test]
+fn sell_large_enough_to_exhaust_a_reserve_is_rejected() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000_000);
+
+    // Give the user a large YES position without going through buy (which
+    // would itself now be capped by the same guard) — split it directly.
+    client.split(&user, &500_000_000);
+
+    let res = client.try_sell(&user, &Prediction::Yes, &101_000_000, &0);
+    assert_eq!(res, Err(Ok(Error::PoolDepthExceeded)));
+    assert_solvent(&h);
+}
+
+#[test]
+fn normal_sized_trades_are_unaffected_by_the_pool_depth_guard() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+
+    // Same trade size as buy_yes_moves_price_up_and_costs_more_than_split_alone
+    // — well under the pool's depth, must still succeed exactly as before.
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    assert!(shares > 1_000);
+    assert_solvent(&h);
+}
