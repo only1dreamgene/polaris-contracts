@@ -271,7 +271,7 @@ track whatever hash is actually uploaded):
 | `polaris_market.wasm` | 45,378 bytes | `082acedae464c0f65be4c27358847243e99990cd44263c98f805544b7896aa02` |
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
 | `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
-| `polaris_smart_wallet_factory.wasm` | 4,536 bytes | `12afe5fec43db2f30b75616589284a73acb71724446ff002fc2ff66423990c91` |
+| `polaris_smart_wallet_factory.wasm` | 6,427 bytes | `921a1e1dbf1b78b9928926cd0662e444feb480dc8f570d36b69509a55006e565` |
 
 ## Deploying (needs the Stellar CLI, not available in this build environment)
 
