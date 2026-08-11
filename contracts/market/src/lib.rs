@@ -642,11 +642,28 @@ impl PolarisMarket {
                 b
             }
             MarketStatus::Cancelled => {
+                // NOT `by + bn`: `sum(all YES balances) == total_supply` and
+                // `sum(all NO balances) == total_supply` are both
+                // independently true (same number) — real collateral only
+                // backs ONE total_supply's worth, not two. Paying `by + bn`
+                // to every holder double-counts and can insolvency-lock
+                // whoever redeems last (confirmed live: a plain matched
+                // split/cancel/redeem already overpaid 2x, then the
+                // treasury's own ordinary pool-seeded redemption failed
+                // outright — "balance is not sufficient to spend"). Paying
+                // each complementary token 0.5 is the standard answer for a
+                // voided market in CTF-style systems generally (Polymarket,
+                // Gnosis) for exactly this reason: it's the only per-holder
+                // formula where summing every payout is *guaranteed* to
+                // equal total_supply exactly, regardless of trading
+                // history — a directional bettor's AMM-subsidized bonus
+                // shares are worth less than face value once nobody's
+                // collateral is "eligible" to originate from resolution.
                 let by = balance_of(&env, Prediction::Yes, &user);
                 let bn = balance_of(&env, Prediction::No, &user);
                 set_balance(&env, Prediction::Yes, &user, 0);
                 set_balance(&env, Prediction::No, &user, 0);
-                by + bn
+                (by + bn) / 2
             }
         };
 

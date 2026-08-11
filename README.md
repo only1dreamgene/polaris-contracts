@@ -60,10 +60,12 @@ WASM contract) for continuous pricing between the two outcome shares.
   configured feed, checks the price is timestamped within ±5 minutes of
   expiry, and marks the winning side (`>=` strike → YES, inclusive).
 - **`cancel()`** — the liveness backstop. Permissionless once
-  `expiry + grace_period` has passed with no settlement. Both sides then
-  redeem 1:1, at par.
-- **`redeem(user)`** — pays out 1:1 collateral per winning share (or per
-  share of either side, if cancelled).
+  `expiry + grace_period` has passed with no settlement. Every holder can
+  then redeem — see "Cancellation payout" below for why it's *not* 1:1 on
+  both sides.
+- **`redeem(user)`** — pays out 1:1 collateral per winning share once
+  resolved; on cancellation, 0.5 collateral per share held on either side
+  (see below).
 
 ## The invariant that matters
 
@@ -80,6 +82,47 @@ The market can never be short of collateral to pay whoever's holding the
 winning side — there's no "empty winning pool" branch to write or test,
 because the invariant makes it structurally impossible. `assert_solvent()`
 in the test suite checks this after every test.
+
+## Cancellation payout
+
+`redeem()` on a cancelled market pays **0.5 collateral per share held on
+either side** (`(balance_yes + balance_no) / 2`), not 1:1 on both — and
+that 0.5 isn't a compromise, it's load-bearing.
+
+`sum(all YES balances) == total_supply` and `sum(all NO balances) ==
+total_supply` are both independently true (the same number) — but real
+collateral only ever backs *one* `total_supply`'s worth, not two.
+`settle()`'s resolved paths get this right by paying only the winning side
+and discarding the other. `cancel()` has no winning side, so an earlier
+version paid *both* in full — which double-counts against a single pool of
+backing collateral.
+
+Caught live, not in review: a single user who did nothing but `split()` a
+plain matched pair (no AMM, no `buy`/`sell` involved at all) — cancel,
+redeem — got back double what they'd locked. The treasury's own,
+completely ordinary redemption of its pool-seeded share then panicked:
+`"balance is not sufficient to spend"`. Existing tests only ever redeemed
+one holder per test and stopped, so nobody had checked whether the *next*
+legitimate holder could still get paid. See
+`cancel_redeem_stays_solvent_for_every_holder_including_treasury` in
+`contracts/market/src/test.rs`.
+
+Paying each complementary token 0.5 is the standard answer for a voided
+market in CTF-style systems generally (Polymarket, Gnosis), for exactly
+this reason: it's the only per-holder formula that's *guaranteed* solvent
+— summed across every holder, payouts equal `total_supply` exactly,
+regardless of trading history — without tracking anything beyond the
+balances that already exist. The alternative that was seriously considered
+and rejected: track each address's actual net collateral contributed and
+refund that. More intuitively "fair" (you get back what you put in), but
+it only works if that tracked amount also moves proportionally through
+`transfer()` — otherwise a sender who transfers away their shares still
+shows a refundable balance for shares they no longer hold, while the
+receiver holds real shares with no refundable balance behind them at all.
+That's real new state that has to stay in perfect sync across
+`split`/`buy`/`merge`/`sell`/`transfer`, which is exactly the kind of
+surface area new bugs come from — not worth it for what a "voided market"
+needs to guarantee.
 
 ## Pool-depth guard
 
@@ -171,7 +214,7 @@ for XLM/USD before going live.
 ## Building & testing
 
 ```sh
-# unit tests (native target, 22 tests)
+# unit tests (native target, 28 tests)
 cargo test -p polaris-market
 
 # release WASM (requires `rustup target add wasm32v1-none`)
@@ -185,7 +228,7 @@ track whatever hash is actually uploaded):
 
 | Contract | Size | SHA-256 |
 |---|---|---|
-| `polaris_market.wasm` | 45,343 bytes | `47908f07ad2088479e549ab6bf2b1e2577b18997b70ea57e5cc34c085c0bc0fb` |
+| `polaris_market.wasm` | 45,378 bytes | `082acedae464c0f65be4c27358847243e99990cd44263c98f805544b7896aa02` |
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
 | `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
 | `polaris_smart_wallet_factory.wasm` | 4,536 bytes | `12afe5fec43db2f30b75616589284a73acb71724446ff002fc2ff66423990c91` |

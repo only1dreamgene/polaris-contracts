@@ -437,7 +437,14 @@ fn cancel_before_grace_elapsed_rejected() {
 }
 
 #[test]
-fn cancel_after_grace_refunds_both_sides_at_par() {
+fn cancel_after_grace_refunds_a_matched_pair_at_merge_parity() {
+    // A matched pair (equal YES+NO from a plain split, no AMM involved) is
+    // worth exactly what merge() would return for burning it together — one
+    // unit of collateral per unit locked, not two. Paying `by + bn` here
+    // (the pre-fix behavior) double-paid this exact case: 2_000 back for
+    // 1_000 actually locked. See `cancel_redeem_stays_solvent_for_every_
+    // holder_including_treasury` for why that matters beyond just this one
+    // user overpaying — it can insolvency-lock whoever redeems next.
     let h = setup(1_000_000, 10_000);
     let user = Address::generate(&h.env);
     fund(&h, &user, 5_000);
@@ -452,21 +459,25 @@ fn cancel_after_grace_refunds_both_sides_at_par() {
 
     let before = token::Client::new(&h.env, &h.token_id).balance(&user);
     let payout = client.redeem(&user);
-    assert_eq!(payout, 2_000); // 1000 YES + 1000 NO, both at par
+    assert_eq!(payout, 1_000); // (1000 YES + 1000 NO) / 2 — matches merge()'s value for the same holding
     let after = token::Client::new(&h.env, &h.token_id).balance(&user);
-    assert_eq!(after - before, 2_000);
+    assert_eq!(after - before, 1_000);
 
     assert_solvent(&h);
 }
 
 #[test]
-fn cancel_refunds_directional_bettor_fully_even_with_no_counterparty() {
+fn cancel_refunds_directional_bettor_half_value_no_counterparty_needed() {
     // The scenario the original parimutuel design special-cased ("empty
     // winning pool"): a single bettor takes a directional position and the
     // oracle never resolves. Because they're actually holding a CTF share
-    // backed 1:1 by locked collateral (not a parimutuel claim on a shared
-    // pool), a full refund falls out of `cancel` + `redeem` with no special
-    // casing at all.
+    // backed by locked collateral (not a parimutuel claim on a shared
+    // pool), a refund falls out of `cancel` + `redeem` with no special
+    // casing at all — but only ever half the shares' face value, same as
+    // any other holder: a voided market pays each complementary token 0.5,
+    // the standard CTF answer (Polymarket, Gnosis) for exactly this reason
+    // — it's the only per-holder formula that's solvent for every possible
+    // holder no matter their trading history, without tracking anything new.
     let h = setup(1_000_000, 10_000);
     let user = Address::generate(&h.env);
     fund(&h, &user, 5_000);
@@ -476,7 +487,7 @@ fn cancel_refunds_directional_bettor_fully_even_with_no_counterparty() {
     h.env.ledger().set_timestamp(h.expiry + h.grace);
     client.cancel();
     let payout = client.redeem(&user);
-    assert_eq!(payout, shares);
+    assert_eq!(payout, shares / 2);
 
     assert_solvent(&h);
 }
@@ -612,5 +623,44 @@ fn normal_sized_trades_are_unaffected_by_the_pool_depth_guard() {
     // — well under the pool's depth, must still succeed exactly as before.
     let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
     assert!(shares > 1_000);
+    assert_solvent(&h);
+}
+
+// ---------- regression: Cancelled redeem must stay solvent for every
+// legitimate holder, not just whoever redeems first ----------
+
+#[test]
+fn cancel_redeem_stays_solvent_for_every_holder_including_treasury() {
+    // Regression for a real bug: redeem's Cancelled branch used to pay
+    // `by + bn` (both balances summed) per holder. `sum(all YES balances)
+    // == total_supply` and `sum(all NO balances) == total_supply` are both
+    // independently true (same number) — real collateral only backs ONE
+    // total_supply's worth, not two. Paying `by + bn` to every holder
+    // double-counted: a plain matched split (no AMM/buy/sell at all) paid
+    // 2_000 back for 1_000 locked, which then starved the treasury's own,
+    // completely ordinary pool-seeded redemption right after — confirmed
+    // live, it panicked with "balance is not sufficient to spend".
+    // Existing cancel tests only ever redeemed ONE holder and stopped, so
+    // this never surfaced. This test is the one that would have caught it:
+    // redeem *every* legitimate holder and confirm each one actually gets
+    // paid, not just that the first one's own numbers add up.
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.split(&user, &1_000); // locks 1_000 collateral for a matched 1_000 YES + 1_000 NO
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace);
+    client.cancel(); // treasury credited pool_yes=pool_no=10_000 (the seed liquidity), same mechanism as settle
+
+    let user_payout = client.redeem(&user);
+    assert_eq!(user_payout, 1_000);
+
+    // The treasury's own, otherwise-uncontroversial redemption must not be
+    // starved by an earlier holder's redemption.
+    let treasury_payout = client.redeem(&h.treasury);
+    assert_eq!(treasury_payout, 10_000); // (10_000 + 10_000) / 2
+
+    assert_eq!(user_payout + treasury_payout, 11_000); // == total_supply at cancellation, exactly
     assert_solvent(&h);
 }
