@@ -204,6 +204,46 @@ sign-in credential anywhere else that talks to the same factory instance —
 see `polaris-oracle`'s `GET /wallets/resolve` and the embeddable widget for
 where this actually gets used, not just left as a latent property.
 
+### Factory wasm pinning
+
+`smart-wallet-factory`'s `deploy()` used to take `wasm_hash` as a caller-
+supplied parameter, with no `require_auth()` either. That combination was
+a real, confirmed-exploitable address-hijack vector, not just a theoretical
+gap: a deployed wallet's address is a pure deterministic function of
+`(this factory, sha256(public_key))` — the exact formula `resolve()`
+exposes as a public, permissionless read for anyone to compute in advance.
+An attacker who learned a victim's public key before the *legitimate*
+deploy transaction landed (e.g. watching it sit in the network's public
+mempool) could race a `deploy(victim_pk, attacker_wasm_hash)` call ahead
+of it. `deploy_v2` at a given (deployer, salt) only ever succeeds once, so
+whichever call lands first *permanently* owns that address — a contract
+designed to look like a smart-wallet while authorizing whatever the
+attacker wants would then be able to take anything later sent to what the
+whole system believes is the victim's wallet.
+
+Reproduced directly (no real mempool race needed to demonstrate it — the
+vulnerability is that nothing stopped this from succeeding at all, for any
+caller, for any already-uploaded wasm): see
+`deploy_always_uses_the_pinned_wasm_never_a_caller_choice` in
+`contracts/smart-wallet-factory/src/test.rs`.
+
+Fixed by pinning the wasm hash once, at factory setup
+(`initialize(admin, wasm_hash)`, admin-authenticated, one-time) — `deploy`
+now takes only `public_key` and always runs the pinned hash. `deploy`
+itself stays deliberately unauthenticated: "anyone can pay to deploy
+anyone's wallet" is the intended, safe design `polaris-oracle` already
+relies on to onboard a user who holds zero XLM — that's only ever safe
+once the code being deployed can no longer be the caller's choice.
+
+This is a breaking interface change from the previously-deployed testnet
+factory. Verified live: deployed a fresh factory instance
+(`CCLDHPEJBENBV3GRZRHO7RH5OZRTBWP7DWB36L3OCWLKEEAP6FJTTJ5U`), initialized
+it, and confirmed via the running `polaris-oracle` (a real email-login
+wallet deploy) plus a direct on-chain `get_public_key` read that the
+deployed wallet's stored key matches exactly what the backend generated —
+the whole path working end to end on the corrected contract, not just in
+`cargo test`.
+
 ## Feed ID
 
 `feed_id` is an `initialize` parameter, not hardcoded. For this build it

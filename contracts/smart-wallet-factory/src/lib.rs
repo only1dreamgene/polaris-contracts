@@ -28,15 +28,76 @@
 //! Soroban's exact deployer-address-plus-salt hash isn't something worth
 //! hand-rolling and hoping matches the host's real derivation when the
 //! genuine on-chain computation is one cheap, free simulated call away.
+//!
+//! ## The wasm this factory deploys is pinned, not caller-chosen
+//!
+//! `wasm_hash` used to be a `deploy()` parameter — any caller could deploy
+//! *any* already-uploaded wasm at any public key's deterministic address,
+//! unauthenticated. Confirmed exploitable, not just theoretical: since the
+//! deployed address is a pure function of (this factory, sha256(public_key))
+//! — the same formula `resolve()` exposes as a public read for anyone to
+//! compute in advance — an attacker who learns a victim's public key before
+//! the legitimate deploy transaction lands (e.g. watching it sit in the
+//! network's public mempool) could race a `deploy(victim_pk,
+//! attacker_wasm_hash)` ahead of it. `deploy_v2` at a given (deployer, salt)
+//! only ever succeeds once, so whichever call lands first *permanently*
+//! owns that address — a malicious contract designed to look like a
+//! smart-wallet while authorizing whatever the attacker wants would then
+//! be able to take anything later sent to what the whole system believes
+//! is the victim's wallet. See `bug_deploy_used_to_let_anyone_pick_the_
+//! wasm_and_hijack_a_victims_address` in `test.rs` for the reproduction.
+//!
+//! Fixed by pinning the wasm hash once, at factory setup
+//! (`initialize(admin, wasm_hash)`, admin-authenticated, one-time), and
+//! having `deploy` always use that stored hash. `deploy` itself stays
+//! deliberately unauthenticated — "anyone can pay to deploy anyone's
+//! wallet" is the intended, safe design the backend already relies on to
+//! onboard users with zero XLM — but now that's only ever safe because the
+//! code being deployed is always this factory's own known-good wallet
+//! implementation, never a caller's choice.
 
-use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, BytesN, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, vec, Address, BytesN, Env, Symbol};
+
+const STORAGE_KEY_WASM_HASH: Symbol = symbol_short!("wasm");
+
+#[contracterror]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[repr(u32)]
+pub enum Error {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+}
 
 #[contract]
 pub struct SmartWalletFactory;
 
 #[contractimpl]
 impl SmartWalletFactory {
-    pub fn deploy(env: Env, public_key: BytesN<65>, wasm_hash: BytesN<32>) -> Address {
+    /// One-time setup pinning which wallet code this factory will ever
+    /// deploy. `admin` is whoever controls this factory's configuration —
+    /// not a role any deployed wallet answers to, just the authority to set
+    /// this once. Must run before `deploy` will do anything.
+    pub fn initialize(env: Env, admin: Address, wasm_hash: BytesN<32>) -> Result<(), Error> {
+        admin.require_auth();
+        if env.storage().instance().has(&STORAGE_KEY_WASM_HASH) {
+            return Err(Error::AlreadyInitialized);
+        }
+        env.storage().instance().set(&STORAGE_KEY_WASM_HASH, &wasm_hash);
+        Ok(())
+    }
+
+    /// Deploys (and atomically initializes) a smart-wallet for
+    /// `public_key`, always running this factory's own pinned wasm — see
+    /// the module doc for why `wasm_hash` isn't a parameter anymore.
+    /// Deliberately unauthenticated: anyone can pay to deploy anyone's
+    /// wallet, which is what lets this system's backend onboard a user who
+    /// holds zero XLM.
+    pub fn deploy(env: Env, public_key: BytesN<65>) -> Result<Address, Error> {
+        let wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_KEY_WASM_HASH)
+            .ok_or(Error::NotInitialized)?;
         let salt = env.crypto().sha256(&public_key.clone().into());
         let address = env
             .deployer()
@@ -47,10 +108,10 @@ impl SmartWalletFactory {
             &symbol_short!("init"),
             vec![&env, public_key.to_val()],
         );
-        address
+        Ok(address)
     }
 
-    /// The address `deploy(public_key, ..)` would produce, computed without
+    /// The address `deploy(public_key)` would produce, computed without
     /// deploying anything — a pure read, safe to call speculatively.
     pub fn resolve(env: Env, public_key: BytesN<65>) -> Address {
         let salt = env.crypto().sha256(&public_key.into());
