@@ -305,6 +305,17 @@ first, on its own, before building anything else; see "Building &
 testing" below and this repo's CI workflow for the explicit two-step
 build this requires.
 
+Verified live on testnet, the full loop, not just `cargo test`: deployed
+a fresh vault (`CDDZCX5PT7FURKHTHNKXGNJJNURS4M7BLLNS6BHRV4RJM6CJT25SNCF5`),
+deposited 20,000,000 stroops, withdrew 10,000,000 of it to seed a real
+market with the vault as `treasury`, settled that market, and called
+`redeem_from_market` — a real transaction
+(`401ddfea828d7050b367c9a9c8507ff509f0e5d3c6558a772b6bccf9b7d61fd0`,
+confirmed `SUCCESS`) that moved exactly 10,000,000 stroops back from the
+market to the vault, landing its balance back at the original 20,000,000.
+Capital seeded a market, then came home, at par, with no manual
+bookkeeping — the entire point of this contract, proven end to end.
+
 ## Feed ID
 
 `feed_id` is an `initialize` parameter, not hardcoded. For this build it
