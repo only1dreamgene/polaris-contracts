@@ -1,0 +1,19 @@
+[package]
+name = "polaris-vault"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+# polaris-market itself is NOT a dependency anywhere (see lib.rs's
+# `market_contract` module doc for why) — its wasm is imported directly via
+# `contractimport!`, which also supplies `market_contract::WASM` for tests
+# to deploy a real market against, same file, one source of truth.
+polaris-mock-lazer = { path = "../mock-lazer" }

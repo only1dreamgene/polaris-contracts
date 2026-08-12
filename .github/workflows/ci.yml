@@ -24,7 +24,18 @@ jobs:
         with:
           targets: wasm32v1-none
       - uses: Swatinem/rust-cache@v2
-      - run: |
+      - name: Build polaris-market first
+        # polaris-vault's `contractimport!` reads polaris-market's compiled
+        # wasm as a *file*, at macro-expansion time — a dependency invisible
+        # to Cargo's own build graph (deliberately: a real Cargo dependency
+        # on polaris-market here caused a wasm export symbol collision, see
+        # contracts/vault/src/lib.rs). Cargo has no reason to order these
+        # two builds relative to each other on its own, so this step is
+        # split out and run first, explicitly, rather than trusting
+        # incidental scheduling to keep working.
+        run: cargo build --release --target wasm32v1-none -p polaris-market
+      - name: Build the rest
+        run: |
           cargo build --release --target wasm32v1-none \
-            -p polaris-market -p polaris-mock-lazer \
-            -p polaris-smart-wallet -p polaris-smart-wallet-factory
+            -p polaris-mock-lazer -p polaris-smart-wallet \
+            -p polaris-smart-wallet-factory -p polaris-vault

@@ -4,7 +4,7 @@ Rust / Soroban smart contracts for **Polaris** — a fully-collateralized,
 non-custodial binary prediction market on XLM/USD, settled by a Pyth Lazer
 price update verified on-chain.
 
-Two contracts, one workspace:
+Five contracts, one workspace:
 
 | Crate | Purpose |
 |---|---|
@@ -12,6 +12,7 @@ Two contracts, one workspace:
 | `contracts/mock-lazer` | Testnet-only stand-in for the real `pyth-lazer-stellar` verifier — echoes a payload back unverified so settlement can be exercised end-to-end without real Pyth signatures. **Never deploy to mainnet.** |
 | `contracts/smart-wallet` | A Soroban custom account contract authorized by a WebAuthn passkey (secp256r1) instead of a keypair — lets a passkey-backed address stand in anywhere a normal `Address` is expected, including as the market contract's `user`. |
 | `contracts/smart-wallet-factory` | Deploys + initializes a `smart-wallet` instance in one atomic call, at a deterministic address derived from the passkey's public key. |
+| `contracts/vault` | Capital-efficiency vault — centralizes LP custody and accounting for market seed liquidity, funded once per depositor rather than fragmented per market. See "The capital-efficiency vault" below. |
 
 ## Why not the original parimutuel design
 
@@ -244,6 +245,66 @@ deployed wallet's stored key matches exactly what the backend generated —
 the whole path working end to end on the corrected contract, not just in
 `cargo test`.
 
+## The capital-efficiency vault
+
+`contracts/vault` is additive and isolated — **zero changes to
+`contracts/market`**. What it actually fixes: every new market's
+`initial_liquidity` used to be wired from the admin's own keypair by hand
+at `initialize()` time, and that seed capital sat siloed in that one
+market's reserves for its entire life, recovered only at settlement into a
+bare `treasury` wallet address with no accounting at all. Fragmented
+capital, manual per-market funding, no record of what's deployed where.
+
+This is deliberately *not* what "cross-margin" usually means in a
+derivatives system — netting risk across open positions, a liquidation
+engine, portfolio-level price marking. That model was considered and
+rejected: it would reintroduce exactly the undercollateralized-position
+risk class this repo's fund-safety work (bugs 2, 5 above) has spent real
+effort eliminating from `contracts/market`. The vault centralizes *custody
+and accounting* of LP capital while every individual market stays exactly
+as fully, independently collateralized as it already was —
+`Market.treasury` is already a generic `Address`; pointing it at this
+contract's address is the entire integration.
+
+- `deposit(from, amount)` — LP capital in, permissionless (same "anyone can
+  pay" shape as the wallet factory's `deploy`).
+- `withdraw(admin, to, amount)` — admin-gated capital out. Funds a new
+  market's seed liquidity (what `polaris-oracle`'s `MarketFactoryService`
+  draws on before calling the existing `deployMarket()`), or an LP
+  redemption. Fails closed on the wrong signer, same as every other
+  admin-gated entrypoint in this system (`AdminGuard`, the wallet factory's
+  own `initialize`).
+- `redeem_from_market(admin, market_id)` — collects the vault's own payout
+  from a settled/cancelled market it was `treasury` for, by calling that
+  market's existing, already-tested `redeem` on the vault's own behalf.
+  The one cross-contract call in this design.
+
+**v1 is deliberately simple, stated up front rather than glossed over**
+(matching `contracts/smart-wallet`'s own "a property this build does not
+implement"): single-admin-owned capital, not fractional LP shares.
+Multiple depositors can `deposit`, but there's no proportional-withdrawal
+accounting yet — a real multi-LP product needs share accounting before
+this is safe to open past a single trusted operator.
+
+**A real build issue, not just a design note — worth knowing if you touch
+this contract:** `redeem_from_market` needs a client for `polaris-market`,
+but depending on that crate directly (for its generated
+`PolarisMarketClient`) pulls its `#[contract]`-exported wasm symbols into
+the *vault's own* compiled output. Confirmed the hard way: `cargo build
+--release --target wasm32v1-none` linked "successfully" but warned
+`function signature mismatch: initialize`, because both contracts export a
+same-named function and the linker was merging them into one binary.
+Fixed with `soroban_sdk::contractimport!`, which reads the target wasm's
+embedded interface spec at compile time — the same spec `polaris-oracle`'s
+`contract.Spec.fromWasm` reads at runtime — to generate a byte-correct
+client (including the right `Result<T, Error>` unwrapping) without linking
+in any of that wasm's executable code. This makes `polaris-market`'s
+*compiled release wasm* a build-time dependency of `polaris-vault` that
+Cargo's own dependency graph doesn't know about — build `polaris-market`
+first, on its own, before building anything else; see "Building &
+testing" below and this repo's CI workflow for the explicit two-step
+build this requires.
+
 ## Feed ID
 
 `feed_id` is an `initialize` parameter, not hardcoded. For this build it
@@ -254,12 +315,17 @@ for XLM/USD before going live.
 ## Building & testing
 
 ```sh
-# unit tests (native target, 28 tests)
-cargo test -p polaris-market
+# unit tests (native target; 51 across the whole workspace, 28 in polaris-market alone)
+cargo test --workspace
 
 # release WASM (requires `rustup target add wasm32v1-none`)
-cargo build --release --target wasm32v1-none -p polaris-market -p polaris-mock-lazer
-shasum -a 256 target/wasm32v1-none/release/polaris_market.wasm
+# polaris-market first, on its own — polaris-vault's contractimport! reads
+# its compiled wasm as a file at build time, a dependency Cargo's own
+# graph doesn't know about (see "The capital-efficiency vault" above).
+cargo build --release --target wasm32v1-none -p polaris-market
+cargo build --release --target wasm32v1-none -p polaris-mock-lazer \
+  -p polaris-smart-wallet -p polaris-smart-wallet-factory -p polaris-vault
+shasum -a 256 target/wasm32v1-none/release/*.wasm
 ```
 
 Current build (recorded here for reference — regenerate after any contract
@@ -272,6 +338,7 @@ track whatever hash is actually uploaded):
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
 | `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
 | `polaris_smart_wallet_factory.wasm` | 6,427 bytes | `921a1e1dbf1b78b9928926cd0662e444feb480dc8f570d36b69509a55006e565` |
+| `polaris_vault.wasm` | 10,568 bytes | `5847a7781556d7c4e727e63fe48a84d6bed9ff6c34686e6a0b09a03d3c925c3d` |
 
 ## Deploying (needs the Stellar CLI, not available in this build environment)
 
