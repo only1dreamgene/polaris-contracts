@@ -3,6 +3,7 @@ extern crate std;
 
 use super::*;
 use market_contract::Client as MarketClient;
+use market_contract::ReflectorConfig;
 use polaris_mock_lazer::MockLazer;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -11,6 +12,63 @@ use soroban_sdk::{
 
 const FEED_ID: u32 = 100;
 const DAY: u64 = 86_400;
+const REFLECTOR_DECIMALS: u32 = 14; // matches the real Reflector testnet oracle, confirmed live
+const REFLECTOR_RESOLUTION_SECS: u32 = 300;
+const REFLECTOR_MAX_STALENESS_SECS: u64 = 600;
+const REFLECTOR_TOLERANCE_BPS: u32 = 150;
+
+/// Duplicated from `contracts/market/src/test.rs`'s own `mod mock_reflector`
+/// — same "exact copy, nothing vault-specific" precedent already set by
+/// `build_payload` below. This crate has no source dependency on
+/// `polaris-market` (only a compiled-wasm import via `contractimport!`, see
+/// the module doc on `market_contract` in `lib.rs`), so it can't share the
+/// Rust type declaration directly; the wasm's own internal code is what
+/// actually constructs `Asset`/`PriceData` when it calls `lastprice`, so
+/// this only needs matching XDR shape (variant/field order), not identity.
+mod mock_reflector {
+    use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+
+    #[contracttype(export = false)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum Asset {
+        Stellar(Address),
+        Other(Symbol),
+    }
+
+    #[contracttype(export = false)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct PriceData {
+        pub price: i128,
+        pub timestamp: u64,
+    }
+
+    const PRICE_KEY: Symbol = symbol_short!("px");
+
+    #[contract]
+    pub struct MockReflector;
+
+    #[contractimpl]
+    impl MockReflector {
+        pub fn set_price(env: Env, price: i128, timestamp: u64) {
+            env.storage().instance().set(&PRICE_KEY, &(price, timestamp));
+        }
+
+        pub fn lastprice(env: Env, _asset: Asset) -> Option<PriceData> {
+            env.storage()
+                .instance()
+                .get::<_, (i128, u64)>(&PRICE_KEY)
+                .map(|(price, timestamp)| PriceData { price, timestamp })
+        }
+
+        pub fn decimals(_env: Env) -> u32 {
+            super::REFLECTOR_DECIMALS
+        }
+
+        pub fn resolution(_env: Env) -> u32 {
+            super::REFLECTOR_RESOLUTION_SECS
+        }
+    }
+}
 
 /// Wire-format payload matching pyth-lazer-stellar-sdk's parser — exact
 /// copy of `contracts/market/src/test.rs`'s `build_payload`, since this is
@@ -151,6 +209,7 @@ fn redeem_from_market_collects_the_vaults_treasury_payout() {
     vault_client.withdraw(&h.admin, &h.admin, &10_000);
 
     let lazer_id = h.env.register(MockLazer, ());
+    let reflector_id = h.env.register(mock_reflector::MockReflector, ());
     let market_id = h.env.register(market_contract::WASM, ());
     let market_client = MarketClient::new(&h.env, &market_id);
     let expiry = h.env.ledger().timestamp() + DAY;
@@ -167,12 +226,20 @@ fn redeem_from_market_collects_the_vaults_treasury_payout() {
         &20u32,
         &h.vault_id, // treasury = this vault, not a bare wallet
         &10_000i128,
+        &ReflectorConfig {
+            contract: reflector_id.clone(),
+            asset: soroban_sdk::Symbol::new(&h.env, "XLM"),
+            max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
+            tolerance_bps: REFLECTOR_TOLERANCE_BPS,
+        },
     );
 
     // No trading — the simplest case: the market's entire pool (all of the
     // vault's seed liquidity) is what the vault should get back.
     h.env.ledger().set_timestamp(expiry);
     let payload = build_payload(FEED_ID, 2_000_000, -2, expiry * 1_000_000); // price $20,000 >= $10,000 strike -> ResolvedYes
+    let reflector_client = mock_reflector::MockReflectorClient::new(&h.env, &reflector_id);
+    reflector_client.set_price(&(2_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &expiry); // agrees with Lazer's $20,000
     market_client.settle(&Bytes::from_slice(&h.env, &payload));
 
     let payout = vault_client.redeem_from_market(&h.admin, &market_id);

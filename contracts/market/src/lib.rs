@@ -16,9 +16,12 @@
 //!   primitive — a share is an internal ledger entry, not a separate token
 //!   contract, so it composes with buy/sell but has no external SEP-41
 //!   identity of its own in this build).
-//! - `settle` verifies a Pyth Lazer update on-chain and marks the winning
-//!   side; `cancel` is the permissionless liveness backstop if no valid
-//!   update ever arrives.
+//! - `settle` verifies a Pyth Lazer update on-chain, cross-checks it
+//!   on-chain against a second, genuinely independent oracle (Reflector
+//!   Network — different node operators, different data pipeline, not
+//!   just a different Pyth product line) before trusting it, and marks the
+//!   winning side; `cancel` is the permissionless liveness backstop if no
+//!   valid, mutually-agreeing update ever arrives.
 //! - `redeem` pays out 1:1 collateral per winning share (or per share of
 //!   either side, if cancelled).
 //!
@@ -27,12 +30,34 @@
 //! lifecycle. Because every share is minted as a matched YES+NO pair, the
 //! contract can never be short of collateral to pay winners — there is no
 //! "empty winning pool" edge case to special-case.
+//!
+//! ## Why `settle` fails closed on the Reflector check, not gracefully
+//!
+//! An earlier, off-chain-only version of this idea (still present in
+//! `polaris-oracle`, Lazer vs. Hermes) skips itself when the second source
+//! is unavailable — correct there, because it's advisory on top of an
+//! already-fully-trusted signature; skipping it leaves the system exactly
+//! as safe as before that check existed. Once the check is *on-chain and
+//! enforced*, as it is here, "skip when inconvenient" stops being neutral:
+//! it turns the real rule into "N-of-2 unless an adversary times
+//! submission around a stale window," which is worse than not having the
+//! check at all. So `None`/stale/divergent Reflector data all reject the
+//! call outright. This doesn't strand funds — the existing permissionless
+//! `cancel` after `expiry + grace_period` is already the unconditional
+//! liveness backstop, so a market that can never get Reflector agreement
+//! cancels and refunds through the exact same well-tested path every other
+//! unresolvable market already uses, preserving the "nobody unilaterally
+//! decides" property even in the failure case.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env,
+    Symbol,
 };
 
 use pyth_lazer_stellar_sdk::PythLazerClient;
+
+mod reflector;
+use reflector::{Asset, ReflectorPulseClient};
 
 /// Protocol fee ceiling: 1000 bps = 10%.
 const MAX_FEE_BPS: u32 = 1_000;
@@ -73,6 +98,21 @@ pub enum Error {
     /// outright rather than letting a reserve hit nearly zero and permanently
     /// break that side's pricing. See `buy`/`sell`'s pool-depth guard.
     PoolDepthExceeded = 23,
+    /// Reflector's `lastprice` returned `None` for this market's asset —
+    /// fails closed, see the module doc's "why fail closed" section.
+    ReflectorPriceUnavailable = 24,
+    /// Reflector's most recent price is older than `reflector.max_staleness_secs`.
+    ReflectorPriceStale = 25,
+    /// Reflector's `decimals()` returned something outside a sane range —
+    /// guards the `10^decimals` scaling math from overflow/underflow.
+    ReflectorDecimalsInvalid = 26,
+    /// Lazer's and Reflector's prices diverge by more than
+    /// `reflector.tolerance_bps` — the on-chain N-of-2 enforcement itself.
+    OracleDivergence = 27,
+    /// `initialize`-time validation: `reflector.max_staleness_secs` is
+    /// narrower than Reflector's own update `resolution()` — a window that
+    /// could never realistically be met.
+    InvalidReflectorConfig = 28,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +140,26 @@ pub enum MarketStatus {
     Cancelled,
 }
 
+/// Settle-time second-oracle settings, bundled into one struct rather than
+/// four more flat `initialize()` scalars — `initialize` was already at 11
+/// positional args, and this codebase has already hit the "two adjacent
+/// same-typed params silently swapped" mistake once (see
+/// `base_fee_bps`/`min_fee_bps`); a named struct is safer than growing to
+/// 15 anonymous ones. Required, not `Option` — no two-tier trust model
+/// where some markets are N-of-2 and others silently aren't.
+#[derive(Clone)]
+#[contracttype]
+pub struct ReflectorConfig {
+    pub contract: Address,
+    /// This system is XLM-only today; hardcoded to `Asset::Other(...)` in
+    /// `settle` (see the vault's fixed-`collateral` precedent for this
+    /// same "one deliberate limitation, stated plainly" shape) rather than
+    /// also storing which `Asset` variant to construct.
+    pub asset: Symbol,
+    pub max_staleness_secs: u64,
+    pub tolerance_bps: u32,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct Market {
@@ -119,6 +179,7 @@ pub struct Market {
     pub pool_no: i128,
     pub total_supply: i128, // == total YES outstanding == total NO outstanding, pre-resolution
     pub initial_liquidity: i128, // immutable reference scale for the fee curve; total_supply >= this always, pre-resolution
+    pub reflector: ReflectorConfig,
 }
 
 #[derive(Clone)]
@@ -263,6 +324,22 @@ fn to_cents(price: i64, exponent: i16) -> i128 {
     }
 }
 
+/// Converts Reflector's `PriceData.price` (scaled by `decimals`, USD-based
+/// same as Lazer's `to_cents`) into whole cents, rounding to the nearest
+/// cent rather than truncating — a floor bias would skew every divergence
+/// comparison in one direction. `decimals` is bounds-checked by the caller
+/// before this is called (guards the `10^(decimals - 2)` scaling from
+/// overflow/underflow at the extremes).
+fn reflector_price_to_cents(price: i128, decimals: u32) -> i128 {
+    let divisor = 10i128.pow(decimals - 2);
+    let half = divisor / 2;
+    if price >= 0 {
+        (price + half) / divisor
+    } else {
+        -((-price + half) / divisor)
+    }
+}
+
 fn reserves(m: &Market, side: Prediction) -> (i128, i128) {
     match side {
         Prediction::Yes => (m.pool_yes, m.pool_no),
@@ -296,6 +373,7 @@ impl PolarisMarket {
         min_fee_bps: u32,
         treasury: Address,
         initial_liquidity: i128,
+        reflector: ReflectorConfig,
     ) -> Result<(), Error> {
         admin.require_auth();
 
@@ -320,6 +398,13 @@ impl PolarisMarket {
         if initial_liquidity <= 0 {
             return Err(Error::InvalidLiquidity);
         }
+        // An admin can't configure a staleness window narrower than
+        // Reflector's own update cadence allows — that would reject every
+        // settle attempt outright, not just unlucky ones.
+        let reflector_resolution = ReflectorPulseClient::new(&env, &reflector.contract).resolution();
+        if reflector.max_staleness_secs < reflector_resolution as u64 {
+            return Err(Error::InvalidReflectorConfig);
+        }
 
         token::Client::new(&env, &collateral).transfer(
             &admin,
@@ -339,6 +424,7 @@ impl PolarisMarket {
             min_fee_bps,
             treasury,
             status: MarketStatus::Open,
+            reflector,
             final_price: 0,
             pool_yes: initial_liquidity,
             pool_no: initial_liquidity,
@@ -581,6 +667,34 @@ impl PolarisMarket {
         }
 
         let final_cents = to_cents(price, exponent);
+
+        // On-chain second-oracle enforcement — see the module doc's "why
+        // fail closed" section. No mutation of `m` has happened yet at
+        // this point, so every early return below is a clean revert.
+        let reflector = ReflectorPulseClient::new(&env, &m.reflector.contract);
+        let reflector_price = reflector
+            .lastprice(&Asset::Other(m.reflector.asset.clone()))
+            .ok_or(Error::ReflectorPriceUnavailable)?;
+        if reflector_price.timestamp + m.reflector.max_staleness_secs < now {
+            return Err(Error::ReflectorPriceStale);
+        }
+        let reflector_decimals = reflector.decimals();
+        if !(2..=30).contains(&reflector_decimals) {
+            return Err(Error::ReflectorDecimalsInvalid);
+        }
+        let reflector_cents = reflector_price_to_cents(reflector_price.price, reflector_decimals);
+        let divergence = (final_cents - reflector_cents).abs();
+        let divergence_bps: i128 = if reflector_cents == 0 {
+            // Zero is invalid data, not a valid comparison point — treat as
+            // maximal divergence rather than divide by zero.
+            10_000
+        } else {
+            (divergence * 10_000) / reflector_cents.abs()
+        };
+        if divergence_bps > m.reflector.tolerance_bps as i128 {
+            return Err(Error::OracleDivergence);
+        }
+
         m.final_price = final_cents;
         m.status = if final_cents >= m.strike_price {
             MarketStatus::ResolvedYes

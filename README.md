@@ -8,7 +8,7 @@ Five contracts, one workspace:
 
 | Crate | Purpose |
 |---|---|
-| `contracts/market` | The market contract. Source of truth for all funds and rules. |
+| `contracts/market` | The market contract. Source of truth for all funds and rules. `settle` requires a second, genuinely independent oracle (Reflector Network) to agree with Pyth Lazer on-chain before finalizing — see "On-chain second-oracle: Reflector Network" below. |
 | `contracts/mock-lazer` | Testnet-only stand-in for the real `pyth-lazer-stellar` verifier — echoes a payload back unverified so settlement can be exercised end-to-end without real Pyth signatures. **Never deploy to mainnet.** |
 | `contracts/smart-wallet` | A Soroban custom account contract authorized by a WebAuthn passkey (secp256r1) instead of a keypair — lets a passkey-backed address stand in anywhere a normal `Address` is expected, including as the market contract's `user`. |
 | `contracts/smart-wallet-factory` | Deploys + initializes a `smart-wallet` instance in one atomic call, at a deterministic address derived from the passkey's public key. |
@@ -316,6 +316,86 @@ market to the vault, landing its balance back at the original 20,000,000.
 Capital seeded a market, then came home, at par, with no manual
 bookkeeping — the entire point of this contract, proven end to end.
 
+## On-chain second-oracle: Reflector Network
+
+`settle` no longer trusts Pyth Lazer's signed payload alone. It also reads
+[Reflector Network](https://reflector.network) — genuinely independent
+node operators and data pipeline, not just a different Pyth product line
+(unlike `polaris-oracle`'s earlier, off-chain-only Lazer-vs-Hermes check,
+which is Pyth-internal defense-in-depth) — on-chain, via a real
+cross-contract call, and requires the two to agree within
+`reflector.tolerance_bps` before finalizing. This is enforced by the
+contract, not the backend: a compromised or buggy `polaris-oracle` process
+can't bypass it.
+
+Confirmed live before writing any of this, not assumed from docs: Reflector
+publishes a free, [SEP-40](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0040.md)-standardized
+testnet oracle at `CCYOZJCOPG34LLQQ7N24YXBM7LL62R7ONMZ3G6WZAAYPB5OYKOMJRN63`
+— `stellar contract invoke ... -- lastprice --asset '{"Other":"XLM"}'`
+returned a real, fresh price; `decimals()` is 14, `resolution()` is 300s
+(a 5-minute update cadence), and the `timestamp` field is Unix seconds
+(confirmed against `date +%s`, not assumed — Lazer's own
+`feed_update_timestamp` is microseconds, a unit mismatch this codebase has
+already been bitten by once, in the settlement-freshness check itself).
+
+**`ReflectorConfig`** (`initialize`'s 12th parameter, required, not
+optional — no two-tier trust model where some markets are N-of-2 and
+others silently aren't) bundles the four second-oracle settings into one
+`contracttype` struct rather than four more flat scalars — `initialize`
+was already at 11 positional args, and growing to 15 anonymous ones is
+exactly the kind of thing that let `base_fee_bps`/`min_fee_bps` almost get
+swapped at a call site once already:
+```rust
+pub struct ReflectorConfig {
+    pub contract: Address,       // which Reflector oracle instance to read
+    pub asset: Symbol,           // e.g. "XLM" — this build is XLM-only,
+                                  // hardcoded to Asset::Other(...) in settle,
+                                  // same "one deliberate limitation, stated
+                                  // plainly" shape as the vault's fixed collateral
+    pub max_staleness_secs: u64, // validated at initialize() against the
+                                  // oracle's own live resolution() — can't be
+                                  // configured narrower than the oracle updates
+    pub tolerance_bps: u32,      // default 150 (1.5%), matching the earlier
+                                  // off-chain check's figure
+}
+```
+
+**Fails closed, not gracefully-degrades** — the opposite of the off-chain
+check's behavior, and deliberately so (see `lib.rs`'s module doc for the
+full reasoning): `None`/stale/divergent Reflector data all reject `settle`
+outright. An enforced on-chain invariant that silently skips itself when
+inconvenient isn't actually enforcing anything — staleness timing isn't
+fully outside an adversary's control, since whoever submits `settle` picks
+which side of Reflector's next update they land on. This doesn't strand
+funds: the existing permissionless `cancel` after `expiry + grace_period`
+is already the unconditional liveness backstop, so a market that can never
+get Reflector agreement cancels and refunds through the exact same
+well-tested path every other unresolvable market already uses — preserving
+"nobody unilaterally decides" even in the failure case.
+
+**Tests** (`contracts/market/src/test.rs`) use a stateful `mod
+mock_reflector` (unlike `mock_lazer`, which is stateless — divergence/
+staleness/unavailability tests need per-test-controlled return values),
+declared once in `contracts/market/src/reflector.rs` and reused by the
+mock rather than redeclared, closing off an XDR-shape-drift trap: two
+independent declarations of a nominally-identical `contracttype` would
+each compile fine but produce mutually-incompatible wire encoding.
+Covers: agreement settles normally; a small in-tolerance divergence (real
+cross-path noise between two aggregations, not a data error) doesn't block
+settlement; a gross divergence rejects and leaves the market `Open`, then
+— concrete proof nothing is stranded, not just an assertion about it —
+correcting the mock price and re-calling `settle` succeeds normally; `None`
+and a stale timestamp both fail closed; and one explicit regression using
+the *exact same inputs* as `settle_yes_wins_on_price_at_or_above_strike`
+(which predates this feature) to prove a Lazer payload that used to settle
+successfully now correctly gets rejected once Reflector disagrees with it.
+
+**This is a new contract version**, not a patch to already-deployed
+instances — deployed wasm is immutable, so any market already live on the
+previous `initialize` signature keeps running exactly as it always has;
+only markets created after this ships get N-of-2 protection, same as every
+other contract change in this repo.
+
 ## Feed ID
 
 `feed_id` is an `initialize` parameter, not hardcoded. For this build it
@@ -326,7 +406,7 @@ for XLM/USD before going live.
 ## Building & testing
 
 ```sh
-# unit tests (native target; 51 across the whole workspace, 28 in polaris-market alone)
+# unit tests (native target; 55 across the whole workspace, 32 in polaris-market alone)
 cargo test --workspace
 
 # release WASM (requires `rustup target add wasm32v1-none`)
@@ -345,7 +425,7 @@ track whatever hash is actually uploaded):
 
 | Contract | Size | SHA-256 |
 |---|---|---|
-| `polaris_market.wasm` | 45,378 bytes | `082acedae464c0f65be4c27358847243e99990cd44263c98f805544b7896aa02` |
+| `polaris_market.wasm` | 51,059 bytes | `0bf6b3abec01c4f27b0c85304f728e0750e5798263e157a3ac66b518cc0194c2` |
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
 | `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
 | `polaris_smart_wallet_factory.wasm` | 6,427 bytes | `921a1e1dbf1b78b9928926cd0662e444feb480dc8f570d36b69509a55006e565` |
@@ -360,5 +440,6 @@ stellar contract invoke --id <CONTRACT_ID> --source deployer --network testnet -
   initialize --admin <ADMIN> --collateral <XLM_SAC> --strike_price 1500000 \
   --expiry <UNIX_TS> --grace_period 3600 --lazer_contract <LAZER_ID> \
   --feed_id 100 --base_fee_bps 100 --min_fee_bps 20 \
-  --treasury <TREASURY> --initial_liquidity 10000000000
+  --treasury <TREASURY> --initial_liquidity 10000000000 \
+  --reflector '{"contract":"CCYOZJCOPG34LLQQ7N24YXBM7LL62R7ONMZ3G6WZAAYPB5OYKOMJRN63","asset":"XLM","max_staleness_secs":600,"tolerance_bps":150}'
 ```

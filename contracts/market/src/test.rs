@@ -29,16 +29,33 @@ fn build_payload(feed_id: u32, price: i64, exponent: i16, feed_ts_micros: u64) -
 
 const FEED_ID: u32 = 100; // XLM/USD, testnet placeholder
 const DAY: u64 = 86_400;
+/// Matches the real Reflector testnet oracle's own `decimals()`, confirmed
+/// live via the `stellar` CLI before writing any of this — see the plan
+/// doc / README for the exact call.
+const REFLECTOR_DECIMALS: u32 = 14;
+const REFLECTOR_RESOLUTION_SECS: u32 = 300;
+const REFLECTOR_MAX_STALENESS_SECS: u64 = 600; // comfortably above resolution
+const REFLECTOR_TOLERANCE_BPS: u32 = 150; // matches the off-chain Lazer-vs-Hermes check's figure
 
 struct Harness {
     env: Env,
     market_id: Address,
     lazer_id: Address,
+    reflector_id: Address,
     token_id: Address,
     admin: Address,
     treasury: Address,
     expiry: u64,
     grace: u64,
+}
+
+fn default_reflector_config(env: &Env, reflector_id: &Address) -> ReflectorConfig {
+    ReflectorConfig {
+        contract: reflector_id.clone(),
+        asset: Symbol::new(env, "XLM"),
+        max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
+        tolerance_bps: REFLECTOR_TOLERANCE_BPS,
+    }
 }
 
 fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
@@ -54,6 +71,7 @@ fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
     let token_admin = token::StellarAssetClient::new(&env, &token_id);
 
     let lazer_id = env.register(mock_lazer::MockLazer, ());
+    let reflector_id = env.register(mock_reflector::MockReflector, ());
     let market_id = env.register(PolarisMarket, ());
 
     let expiry = env.ledger().timestamp() + DAY;
@@ -74,12 +92,14 @@ fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
         &20u32,  // min fee: 0.2%
         &treasury,
         &initial_liquidity,
+        &default_reflector_config(&env, &reflector_id),
     );
 
     Harness {
         env,
         market_id,
         lazer_id,
+        reflector_id,
         token_id,
         admin,
         treasury,
@@ -90,6 +110,17 @@ fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
 
 fn fund(h: &Harness, who: &Address, amount: i128) {
     token::StellarAssetClient::new(&h.env, &h.token_id).mint(who, &amount);
+}
+
+/// Sets the mock Reflector's price to exactly agree with `cents` (converted
+/// through the same `REFLECTOR_DECIMALS` scaling `reflector_price_to_cents`
+/// inverts), timestamped at the current ledger time — for tests that need
+/// `settle` to pass the cross-check without being *about* the cross-check
+/// itself.
+fn set_reflector_price_cents(h: &Harness, cents: i128) {
+    let client = mock_reflector::MockReflectorClient::new(&h.env, &h.reflector_id);
+    let price = cents * 10i128.pow(REFLECTOR_DECIMALS - 2);
+    client.set_price(&price, &h.env.ledger().timestamp());
 }
 
 mod mock_lazer {
@@ -108,6 +139,47 @@ mod mock_lazer {
     }
 }
 
+mod mock_reflector {
+    // Function names/signatures must match `reflector::Contract`'s exactly
+    // (Soroban dispatches by name + XDR shape at runtime, not Rust trait
+    // identity — see `reflector.rs`'s module doc) — but reuses its `Asset`/
+    // `PriceData` types via `super::` rather than redeclaring them, closing
+    // off the XDR-shape-drift trap that redeclaring would open.
+    use super::reflector::{Asset, PriceData};
+    use soroban_sdk::{contract, contractimpl, symbol_short, Env};
+
+    const PRICE_KEY: soroban_sdk::Symbol = symbol_short!("px");
+
+    #[contract]
+    pub struct MockReflector;
+
+    #[contractimpl]
+    impl MockReflector {
+        pub fn set_price(env: Env, price: i128, timestamp: u64) {
+            env.storage().instance().set(&PRICE_KEY, &(price, timestamp));
+        }
+
+        pub fn set_none(env: Env) {
+            env.storage().instance().remove(&PRICE_KEY);
+        }
+
+        pub fn lastprice(env: Env, _asset: Asset) -> Option<PriceData> {
+            env.storage()
+                .instance()
+                .get::<_, (i128, u64)>(&PRICE_KEY)
+                .map(|(price, timestamp)| PriceData { price, timestamp })
+        }
+
+        pub fn decimals(_env: Env) -> u32 {
+            super::REFLECTOR_DECIMALS
+        }
+
+        pub fn resolution(_env: Env) -> u32 {
+            super::REFLECTOR_RESOLUTION_SECS
+        }
+    }
+}
+
 // ---------- initialize ----------
 
 #[test]
@@ -121,35 +193,51 @@ fn init_rejects_bad_params() {
     let token_id = sac.address();
     token::StellarAssetClient::new(&env, &token_id).mint(&admin, &1_000_000);
     let lazer_id = env.register(mock_lazer::MockLazer, ());
+    let reflector_id = env.register(mock_reflector::MockReflector, ());
+    let reflector_config = default_reflector_config(&env, &reflector_id);
     let expiry = env.ledger().timestamp() + DAY;
 
     let bad_strike = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &bad_strike);
     assert_eq!(
-        c.try_initialize(&admin, &token_id, &0i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128),
+        c.try_initialize(&admin, &token_id, &0i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128, &reflector_config),
         Err(Ok(Error::InvalidStrikePrice))
     );
 
     let bad_expiry = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &bad_expiry);
     assert_eq!(
-        c.try_initialize(&admin, &token_id, &6_000_000i128, &1u64, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128),
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &1u64, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128, &reflector_config),
         Err(Ok(Error::InvalidExpiry))
     );
 
     let bad_fee = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &bad_fee);
     assert_eq!(
-        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &1001u32, &20u32, &treasury, &1000i128),
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &1001u32, &20u32, &treasury, &1000i128, &reflector_config),
         Err(Ok(Error::InvalidFeeBps))
     );
 
     let bad_fee_range = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &bad_fee_range);
     assert_eq!(
-        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &50u32, &100u32, &treasury, &1000i128),
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &50u32, &100u32, &treasury, &1000i128, &reflector_config),
         Err(Ok(Error::InvalidFeeBps)),
         "min_fee_bps > base_fee_bps must be rejected"
+    );
+
+    let bad_reflector = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &bad_reflector);
+    let too_narrow = ReflectorConfig {
+        contract: reflector_id.clone(),
+        asset: Symbol::new(&env, "XLM"),
+        max_staleness_secs: REFLECTOR_RESOLUTION_SECS as u64 - 1, // narrower than resolution()
+        tolerance_bps: REFLECTOR_TOLERANCE_BPS,
+    };
+    assert_eq!(
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128, &too_narrow),
+        Err(Ok(Error::InvalidReflectorConfig)),
+        "a staleness window narrower than Reflector's own update resolution must be rejected"
     );
 }
 
@@ -177,6 +265,7 @@ fn double_initialize_rejected() {
     let res = client.try_initialize(
         &h.admin, &h.token_id, &1_000_000i128, &h.expiry, &h.grace, &h.lazer_id,
         &FEED_ID, &100u32, &20u32, &h.treasury, &10_000i128,
+        &default_reflector_config(&h.env, &h.reflector_id),
     );
     assert_eq!(res, Err(Ok(Error::AlreadyInitialized)));
 }
@@ -353,6 +442,7 @@ fn settle_yes_wins_on_price_at_or_above_strike() {
     // price exactly at strike: $10,000.00 == 1_000_000_000_00 * 10^-8
     let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
     let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000); // agrees with Lazer's $10,000.00
     client.settle(&bytes);
 
     let m = client.get_market();
@@ -379,6 +469,7 @@ fn settle_no_wins_below_strike_and_yes_side_gets_nothing() {
     h.env.ledger().set_timestamp(h.expiry);
     let payload = build_payload(FEED_ID, 9_999_00000000, -8, h.expiry * 1_000_000);
     let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 999_900); // agrees with Lazer's $9,999.00
     client.settle(&bytes);
 
     let m = client.get_market();
@@ -420,9 +511,86 @@ fn double_settle_rejected() {
     h.env.ledger().set_timestamp(h.expiry);
     let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
     let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
     client.settle(&bytes);
     let res = client.try_settle(&bytes);
     assert_eq!(res, Err(Ok(Error::AlreadyFinalized)));
+}
+
+// ---------- on-chain Reflector cross-check ----------
+
+#[test]
+fn settle_rejects_when_reflector_has_no_price_yet() {
+    // Fails closed, not gracefully-degrades — the whole point of moving
+    // this on-chain (see the module doc's "why fail closed" section). Mock
+    // Reflector starts with no price set at all (`lastprice` returns
+    // `None`), same as a fresh/never-updated real oracle instance would.
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::ReflectorPriceUnavailable)));
+    assert_eq!(client.get_market().status, MarketStatus::Open, "a failed cross-check must not finalize the market");
+}
+
+#[test]
+fn settle_rejects_a_stale_reflector_price() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    let stale_ts = h.expiry - REFLECTOR_MAX_STALENESS_SECS - 1;
+    let reflector_client = mock_reflector::MockReflectorClient::new(&h.env, &h.reflector_id);
+    reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &stale_ts);
+
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::ReflectorPriceStale)));
+    assert_eq!(client.get_market().status, MarketStatus::Open);
+}
+
+#[test]
+fn settle_rejects_on_gross_lazer_reflector_divergence_and_is_not_stranded() {
+    // This is the whole point of the feature: a Lazer payload that, before
+    // this change, would have settled the market successfully (see
+    // `settle_yes_wins_on_price_at_or_above_strike`, identical inputs)
+    // instead gets rejected once a genuinely independent second oracle
+    // disagrees with it. Then proves the rejection didn't strand
+    // anything — correcting the mock price and re-calling `settle`
+    // succeeds normally, same as it always would have.
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000); // Lazer: $10,000.00
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 2_000_000); // Reflector: $20,000.00 — 100% apart, way past 150bps
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::OracleDivergence)));
+    assert_eq!(client.get_market().status, MarketStatus::Open, "a divergence rejection must not finalize the market");
+
+    set_reflector_price_cents(&h, 1_000_000); // corrected to agree
+    client.settle(&bytes);
+    assert_eq!(client.get_market().status, MarketStatus::ResolvedYes);
+}
+
+#[test]
+fn settle_accepts_a_small_divergence_within_tolerance() {
+    // 150bps = 1.5% default tolerance — a real but small cross-path
+    // discrepancy (the two oracles' own aggregation/latency differences,
+    // not a data error) must not block a healthy settlement.
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000); // $10,000.00
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_001_000); // $10,010.00 — 100bps apart, under the 150bps default
+    client.settle(&bytes);
+    assert_eq!(client.get_market().status, MarketStatus::ResolvedYes);
 }
 
 // ---------- cancel (liveness backstop) ----------
