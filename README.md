@@ -1,5 +1,7 @@
 # polaris-contracts
 
+[![CI](https://github.com/samuel2926i39-art/polaris-contracts/actions/workflows/ci.yml/badge.svg)](https://github.com/samuel2926i39-art/polaris-contracts/actions/workflows/ci.yml)
+
 Rust / Soroban smart contracts for **Polaris** — a fully-collateralized,
 non-custodial binary prediction market on XLM/USD, settled by a Pyth Lazer
 price update verified on-chain.
