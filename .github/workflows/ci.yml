@@ -12,7 +12,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
       - uses: Swatinem/rust-cache@v2
+      - name: Build polaris-market's wasm first
+        # contracts/vault AND contracts/smart-wallet-factory both read
+        # sibling contracts' compiled wasm as *files* at macro-expansion
+        # time via `contractimport!`, even for a native `cargo test` build —
+        # a dependency invisible to Cargo's own build graph (see the
+        # identical steps in the wasm-build job below, and
+        # contracts/vault/src/lib.rs, for why). A fresh CI runner has never
+        # built anything, so `cargo test --workspace` fails outright without
+        # this — confirmed live: this exact gap was in production, broken,
+        # since the vault was first added, because every local run had
+        # already built the wasm manually first and never hit it.
+        run: cargo build --release --target wasm32v1-none -p polaris-market
+      - name: Build the rest
+        run: |
+          cargo build --release --target wasm32v1-none \
+            -p polaris-mock-lazer -p polaris-smart-wallet \
+            -p polaris-smart-wallet-factory -p polaris-vault
       - run: cargo test --workspace
 
   wasm-build:
