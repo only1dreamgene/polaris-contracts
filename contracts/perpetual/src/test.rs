@@ -38,21 +38,32 @@ struct Harness {
     market_id: Address,
     lazer_id: Address,
     reflector_id: Address,
+    redstone_id: Address,
     token_id: Address,
     admin: Address,
     treasury: Address,
 }
 
-fn default_price_oracle(env: &Env, lazer_id: &Address, reflector_id: &Address) -> PriceOracleConfig {
+fn default_price_oracle(env: &Env, lazer_id: &Address, reflector_id: &Address, redstone_id: &Address) -> PriceOracleConfig {
     PriceOracleConfig {
         lazer_contract: lazer_id.clone(),
         feed_id: FEED_ID,
-        reflector: ReflectorConfig {
+        reflector: OracleFeedConfig {
             contract: reflector_id.clone(),
-            asset: soroban_sdk::Symbol::new(env, "XLM"),
+            asset: polaris_ctf_math::sep40::Asset::Other(soroban_sdk::Symbol::new(env, "XLM")),
             max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
             tolerance_bps: REFLECTOR_TOLERANCE_BPS,
         },
+        // Overwritten live by `initialize` regardless of what's passed
+        // here — see `PriceOracleConfig`'s doc comment.
+        reflector_decimals_at_init: 0,
+        redstone: OracleFeedConfig {
+            contract: redstone_id.clone(),
+            asset: polaris_ctf_math::sep40::Asset::Stellar(Address::generate(env)),
+            max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
+            tolerance_bps: REFLECTOR_TOLERANCE_BPS,
+        },
+        redstone_decimals_at_init: 0,
     }
 }
 
@@ -69,13 +80,14 @@ fn setup(initial_liquidity: i128, with_oracle: bool) -> Harness {
     let token_admin = token::StellarAssetClient::new(&env, &token_id);
 
     let lazer_id = env.register(mock_lazer::MockLazer, ());
-    let reflector_id = env.register(mock_reflector::MockReflector, ());
+    let reflector_id = env.register(mock_sep40::MockSep40, ());
+    let redstone_id = env.register(mock_sep40::MockSep40, ());
     let market_id = env.register(PolarisPerpetual, ());
 
     token_admin.mint(&admin, &(initial_liquidity * 1000));
 
     let price_oracle = if with_oracle {
-        Some(default_price_oracle(&env, &lazer_id, &reflector_id))
+        Some(default_price_oracle(&env, &lazer_id, &reflector_id, &redstone_id))
     } else {
         None
     };
@@ -83,7 +95,7 @@ fn setup(initial_liquidity: i128, with_oracle: bool) -> Harness {
     let client = PolarisPerpetualClient::new(&env, &market_id);
     client.initialize(&admin, &token_id, &100u32, &20u32, &treasury, &initial_liquidity, &price_oracle);
 
-    Harness { env, market_id, lazer_id, reflector_id, token_id, admin, treasury }
+    Harness { env, market_id, lazer_id, reflector_id, redstone_id, token_id, admin, treasury }
 }
 
 fn fund(h: &Harness, who: &Address, amount: i128) {
@@ -91,7 +103,13 @@ fn fund(h: &Harness, who: &Address, amount: i128) {
 }
 
 fn set_reflector_price_cents(h: &Harness, cents: i128) {
-    let client = mock_reflector::MockReflectorClient::new(&h.env, &h.reflector_id);
+    let client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
+    let price = cents * 10i128.pow(REFLECTOR_DECIMALS - 2);
+    client.set_price(&price, &h.env.ledger().timestamp());
+}
+
+fn set_redstone_price_cents(h: &Harness, cents: i128) {
+    let client = mock_sep40::MockSep40Client::new(&h.env, &h.redstone_id);
     let price = cents * 10i128.pow(REFLECTOR_DECIMALS - 2);
     client.set_price(&price, &h.env.ledger().timestamp());
 }
@@ -110,31 +128,50 @@ mod mock_lazer {
     }
 }
 
-mod mock_reflector {
-    use polaris_ctf_math::reflector::{Asset, PriceData};
+/// A mock of the generic SEP-40 interface — reused for both the Reflector
+/// and RedStone legs (two independent registered instances), since both
+/// real providers implement the identical interface. See
+/// `polaris-market/src/test.rs`'s identically-named module for the fuller
+/// rationale.
+mod mock_sep40 {
+    use polaris_ctf_math::sep40::{Asset, PriceData};
     use soroban_sdk::{contract, contractimpl, symbol_short, Env};
 
     const PRICE_KEY: soroban_sdk::Symbol = symbol_short!("px");
+    const DECIMALS_KEY: soroban_sdk::Symbol = symbol_short!("dec");
+    const RESOLUTION_KEY: soroban_sdk::Symbol = symbol_short!("res");
 
     #[contract]
-    pub struct MockReflector;
+    pub struct MockSep40;
 
     #[contractimpl]
-    impl MockReflector {
+    impl MockSep40 {
         pub fn set_price(env: Env, price: i128, timestamp: u64) {
             env.storage().instance().set(&PRICE_KEY, &(price, timestamp));
+        }
+
+        pub fn set_none(env: Env) {
+            env.storage().instance().remove(&PRICE_KEY);
+        }
+
+        pub fn set_decimals(env: Env, decimals: u32) {
+            env.storage().instance().set(&DECIMALS_KEY, &decimals);
+        }
+
+        pub fn set_resolution(env: Env, resolution: u32) {
+            env.storage().instance().set(&RESOLUTION_KEY, &resolution);
         }
 
         pub fn lastprice(env: Env, _asset: Asset) -> Option<PriceData> {
             env.storage().instance().get::<_, (i128, u64)>(&PRICE_KEY).map(|(price, timestamp)| PriceData { price, timestamp })
         }
 
-        pub fn decimals(_env: Env) -> u32 {
-            super::REFLECTOR_DECIMALS
+        pub fn decimals(env: Env) -> u32 {
+            env.storage().instance().get(&DECIMALS_KEY).unwrap_or(super::REFLECTOR_DECIMALS)
         }
 
-        pub fn resolution(_env: Env) -> u32 {
-            super::REFLECTOR_RESOLUTION_SECS
+        pub fn resolution(env: Env) -> u32 {
+            env.storage().instance().get(&RESOLUTION_KEY).unwrap_or(super::REFLECTOR_RESOLUTION_SECS)
         }
     }
 }
@@ -173,7 +210,7 @@ fn double_initialize_rejected() {
     let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
     let res = client.try_initialize(
         &h.admin, &h.token_id, &100u32, &20u32, &h.treasury, &10_000i128,
-        &Some(default_price_oracle(&h.env, &h.lazer_id, &h.reflector_id)),
+        &Some(default_price_oracle(&h.env, &h.lazer_id, &h.reflector_id, &h.redstone_id)),
     );
     assert_eq!(res, Err(Ok(Error::AlreadyInitialized)));
 }
@@ -280,6 +317,7 @@ fn checkpoint_records_price_and_changes_nothing_else() {
     let payload = build_payload(FEED_ID, 10_000_00000000, -8, now * 1_000_000);
     let bytes = Bytes::from_slice(&h.env, &payload);
     set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
     client.record_price_checkpoint(&bytes);
 
     let after = client.get_market();
@@ -315,9 +353,73 @@ fn checkpoint_rejects_on_gross_lazer_reflector_divergence() {
     let bytes = Bytes::from_slice(&h.env, &payload);
 
     set_reflector_price_cents(&h, 2_000_000); // Reflector: $20,000.00 — gross divergence
+    set_redstone_price_cents(&h, 1_000_000); // RedStone agrees with Lazer — isolates the Reflector leg
     let res = client.try_record_price_checkpoint(&bytes);
     assert_eq!(res, Err(Ok(Error::OracleDivergence)));
     assert_eq!(client.get_market().last_price_cents, 0, "a rejected checkpoint must not record anything");
+}
+
+#[test]
+fn checkpoint_succeeds_when_lazer_reflector_and_redstone_all_agree() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, now * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+    client.record_price_checkpoint(&bytes);
+    assert_eq!(client.get_market().last_price_cents, 1_000_000);
+}
+
+#[test]
+fn checkpoint_rejects_on_redstone_divergence_even_when_reflector_agrees() {
+    // Unanimous, not majority — same proof as polaris-market's
+    // settle_rejects_on_redstone_divergence_even_when_reflector_agrees.
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, now * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000); // agrees with Lazer
+    set_redstone_price_cents(&h, 2_000_000); // $20,000.00 — gross divergence
+    let res = client.try_record_price_checkpoint(&bytes);
+    assert_eq!(res, Err(Ok(Error::OracleDivergence)));
+    assert_eq!(client.get_market().last_price_cents, 0);
+}
+
+#[test]
+fn checkpoint_rejects_when_redstone_has_no_price_yet() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, now * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000); // Reflector agrees; RedStone never set
+    let res = client.try_record_price_checkpoint(&bytes);
+    assert_eq!(res, Err(Ok(Error::RedstonePriceUnavailable)));
+}
+
+#[test]
+fn checkpoint_rejects_when_redstones_decimals_drift_from_what_was_pinned_at_init() {
+    // Same landmine `polaris-market`'s equivalent test closes — see this
+    // repo's README and `OracleCheckError::DecimalsChanged`'s doc comment.
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, now * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+    mock_sep40::MockSep40Client::new(&h.env, &h.redstone_id).set_decimals(&(REFLECTOR_DECIMALS + 4));
+
+    let res = client.try_record_price_checkpoint(&bytes);
+    assert_eq!(res, Err(Ok(Error::RedstoneDecimalsChanged)));
+    assert_eq!(client.get_market().last_price_cents, 0);
 }
 
 // ---------- terminate ----------

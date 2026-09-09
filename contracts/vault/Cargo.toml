@@ -9,6 +9,15 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+# Not for its math (vault never calls any of it) — `contractimport!` in
+# lib.rs needs `Asset` (a field type inside `polaris-market`'s exported
+# `OracleFeedConfig`) resolvable in scope at the macro's invocation site;
+# ctf-math is the canonical declaration, confirmed safe as a normal
+# dependency here for the same reason it already is for `polaris-market`/
+# `polaris-perpetual` — no `#[contract]` in it, so none of the
+# wasm-symbol-collision hazard `market_contract`'s own doc comment
+# describes for a *real* contract crate.
+polaris-ctf-math = { path = "../ctf-math" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

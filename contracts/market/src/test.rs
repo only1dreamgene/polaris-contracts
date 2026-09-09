@@ -3,7 +3,7 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{token, Address, Env};
+use soroban_sdk::{token, Address, Env, Symbol};
 
 /// Wire-format payload matching pyth-lazer-stellar-sdk's parser: magic(4) +
 /// timestamp(8, LE µs) + channel(1) + num_feeds(1) + [feed_id(4) +
@@ -49,10 +49,24 @@ struct Harness {
     grace: u64,
 }
 
-fn default_reflector_config(env: &Env, reflector_id: &Address) -> ReflectorConfig {
-    ReflectorConfig {
+fn default_reflector_config(env: &Env, reflector_id: &Address) -> OracleFeedConfig {
+    OracleFeedConfig {
         contract: reflector_id.clone(),
-        asset: Symbol::new(env, "XLM"),
+        asset: polaris_ctf_math::sep40::Asset::Other(Symbol::new(env, "XLM")),
+        max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
+        tolerance_bps: REFLECTOR_TOLERANCE_BPS,
+    }
+}
+
+/// RedStone's real Stellar SEP-40 wrapper keys XLM under
+/// `Asset::Stellar(<native XLM SAC address>)`, not `Asset::Other("XLM")`
+/// like Reflector — confirmed live against the real mainnet contract, see
+/// this repo's README. The mock doesn't actually gate on the asset value,
+/// but a fresh address stands in for "the SAC" for realism.
+fn default_redstone_config(env: &Env, redstone_id: &Address) -> OracleFeedConfig {
+    OracleFeedConfig {
+        contract: redstone_id.clone(),
+        asset: polaris_ctf_math::sep40::Asset::Stellar(Address::generate(env)),
         max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
         tolerance_bps: REFLECTOR_TOLERANCE_BPS,
     }
@@ -71,7 +85,7 @@ fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
     let token_admin = token::StellarAssetClient::new(&env, &token_id);
 
     let lazer_id = env.register(mock_lazer::MockLazer, ());
-    let reflector_id = env.register(mock_reflector::MockReflector, ());
+    let reflector_id = env.register(mock_sep40::MockSep40, ());
     let market_id = env.register(PolarisMarket, ());
 
     let expiry = env.ledger().timestamp() + DAY;
@@ -93,6 +107,7 @@ fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
         &treasury,
         &initial_liquidity,
         &default_reflector_config(&env, &reflector_id),
+        &None, // no RedStone leg — matches every real testnet market today
     );
 
     Harness {
@@ -108,6 +123,57 @@ fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
     }
 }
 
+/// Like `setup`, but also configures a RedStone leg — for the handful of
+/// tests specifically about unanimous 3-way corroboration. Kept separate
+/// from `setup` (duplicated, not parameterized) so the ~30 existing tests
+/// that call `setup` stay byte-identical proof that an unconfigured
+/// RedStone leg changes nothing — the regression bar this whole feature
+/// is built around.
+fn setup_with_redstone(strike_cents: i128, initial_liquidity: i128) -> (Harness, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_id = sac.address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_id);
+
+    let lazer_id = env.register(mock_lazer::MockLazer, ());
+    let reflector_id = env.register(mock_sep40::MockSep40, ());
+    let redstone_id = env.register(mock_sep40::MockSep40, ());
+    let market_id = env.register(PolarisMarket, ());
+
+    let expiry = env.ledger().timestamp() + DAY;
+    let grace = 3_600u64;
+
+    token_admin.mint(&admin, &(initial_liquidity * 1000));
+
+    let client = PolarisMarketClient::new(&env, &market_id);
+    client.initialize(
+        &admin,
+        &token_id,
+        &strike_cents,
+        &expiry,
+        &grace,
+        &lazer_id,
+        &FEED_ID,
+        &100u32,
+        &20u32,
+        &treasury,
+        &initial_liquidity,
+        &default_reflector_config(&env, &reflector_id),
+        &Some(default_redstone_config(&env, &redstone_id)),
+    );
+
+    (
+        Harness { env, market_id, lazer_id, reflector_id, token_id, admin, treasury, expiry, grace },
+        redstone_id,
+    )
+}
+
 fn fund(h: &Harness, who: &Address, amount: i128) {
     token::StellarAssetClient::new(&h.env, &h.token_id).mint(who, &amount);
 }
@@ -118,9 +184,18 @@ fn fund(h: &Harness, who: &Address, amount: i128) {
 /// `settle` to pass the cross-check without being *about* the cross-check
 /// itself.
 fn set_reflector_price_cents(h: &Harness, cents: i128) {
-    let client = mock_reflector::MockReflectorClient::new(&h.env, &h.reflector_id);
+    let client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
     let price = cents * 10i128.pow(REFLECTOR_DECIMALS - 2);
     client.set_price(&price, &h.env.ledger().timestamp());
+}
+
+/// Same conversion as `set_reflector_price_cents`, for the RedStone leg —
+/// `redstone_id` isn't part of `Harness` (only `setup_with_redstone`'s
+/// tests use it), so it's passed explicitly.
+fn set_redstone_price_cents(env: &Env, redstone_id: &Address, cents: i128) {
+    let client = mock_sep40::MockSep40Client::new(env, redstone_id);
+    let price = cents * 10i128.pow(REFLECTOR_DECIMALS - 2);
+    client.set_price(&price, &env.ledger().timestamp());
 }
 
 mod mock_lazer {
@@ -139,28 +214,47 @@ mod mock_lazer {
     }
 }
 
-mod mock_reflector {
-    // Function names/signatures must match `reflector::Contract`'s exactly
-    // (Soroban dispatches by name + XDR shape at runtime, not Rust trait
-    // identity — see `reflector.rs`'s module doc) — but reuses its `Asset`/
-    // `PriceData` types via `super::` rather than redeclaring them, closing
-    // off the XDR-shape-drift trap that redeclaring would open.
-    use polaris_ctf_math::reflector::{Asset, PriceData};
+/// A mock of the generic SEP-40 interface — reused for *both* the
+/// Reflector leg and (RedStone-specific tests only) the RedStone leg, two
+/// independent registered instances of the same mock, since both real
+/// providers implement the identical interface (confirmed live for both
+/// — see this repo's README). Function names/signatures must match
+/// `sep40::Contract`'s exactly (Soroban dispatches by name + XDR shape at
+/// runtime, not Rust trait identity) — but reuses its `Asset`/`PriceData`
+/// types via `polaris_ctf_math` rather than redeclaring them, closing off
+/// the XDR-shape-drift trap that redeclaring would open.
+mod mock_sep40 {
+    use polaris_ctf_math::sep40::{Asset, PriceData};
     use soroban_sdk::{contract, contractimpl, symbol_short, Env};
 
     const PRICE_KEY: soroban_sdk::Symbol = symbol_short!("px");
+    const DECIMALS_KEY: soroban_sdk::Symbol = symbol_short!("dec");
+    const RESOLUTION_KEY: soroban_sdk::Symbol = symbol_short!("res");
 
     #[contract]
-    pub struct MockReflector;
+    pub struct MockSep40;
 
     #[contractimpl]
-    impl MockReflector {
+    impl MockSep40 {
         pub fn set_price(env: Env, price: i128, timestamp: u64) {
             env.storage().instance().set(&PRICE_KEY, &(price, timestamp));
         }
 
         pub fn set_none(env: Env) {
             env.storage().instance().remove(&PRICE_KEY);
+        }
+
+        /// Defaults to `REFLECTOR_DECIMALS` until overridden — lets a test
+        /// simulate a provider's `decimals()` drifting *after*
+        /// `initialize()` pinned it, exactly the landmine
+        /// `verify_oracle_corroboration`'s `DecimalsChanged` guard exists
+        /// to catch (see this repo's README).
+        pub fn set_decimals(env: Env, decimals: u32) {
+            env.storage().instance().set(&DECIMALS_KEY, &decimals);
+        }
+
+        pub fn set_resolution(env: Env, resolution: u32) {
+            env.storage().instance().set(&RESOLUTION_KEY, &resolution);
         }
 
         pub fn lastprice(env: Env, _asset: Asset) -> Option<PriceData> {
@@ -170,12 +264,12 @@ mod mock_reflector {
                 .map(|(price, timestamp)| PriceData { price, timestamp })
         }
 
-        pub fn decimals(_env: Env) -> u32 {
-            super::REFLECTOR_DECIMALS
+        pub fn decimals(env: Env) -> u32 {
+            env.storage().instance().get(&DECIMALS_KEY).unwrap_or(super::REFLECTOR_DECIMALS)
         }
 
-        pub fn resolution(_env: Env) -> u32 {
-            super::REFLECTOR_RESOLUTION_SECS
+        pub fn resolution(env: Env) -> u32 {
+            env.storage().instance().get(&RESOLUTION_KEY).unwrap_or(super::REFLECTOR_RESOLUTION_SECS)
         }
     }
 }
@@ -193,51 +287,69 @@ fn init_rejects_bad_params() {
     let token_id = sac.address();
     token::StellarAssetClient::new(&env, &token_id).mint(&admin, &1_000_000);
     let lazer_id = env.register(mock_lazer::MockLazer, ());
-    let reflector_id = env.register(mock_reflector::MockReflector, ());
+    let reflector_id = env.register(mock_sep40::MockSep40, ());
     let reflector_config = default_reflector_config(&env, &reflector_id);
     let expiry = env.ledger().timestamp() + DAY;
 
     let bad_strike = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &bad_strike);
     assert_eq!(
-        c.try_initialize(&admin, &token_id, &0i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128, &reflector_config),
+        c.try_initialize(&admin, &token_id, &0i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128, &reflector_config, &None),
         Err(Ok(Error::InvalidStrikePrice))
     );
 
     let bad_expiry = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &bad_expiry);
     assert_eq!(
-        c.try_initialize(&admin, &token_id, &6_000_000i128, &1u64, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128, &reflector_config),
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &1u64, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128, &reflector_config, &None),
         Err(Ok(Error::InvalidExpiry))
     );
 
     let bad_fee = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &bad_fee);
     assert_eq!(
-        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &1001u32, &20u32, &treasury, &1000i128, &reflector_config),
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &1001u32, &20u32, &treasury, &1000i128, &reflector_config, &None),
         Err(Ok(Error::InvalidFeeBps))
     );
 
     let bad_fee_range = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &bad_fee_range);
     assert_eq!(
-        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &50u32, &100u32, &treasury, &1000i128, &reflector_config),
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &50u32, &100u32, &treasury, &1000i128, &reflector_config, &None),
         Err(Ok(Error::InvalidFeeBps)),
         "min_fee_bps > base_fee_bps must be rejected"
     );
 
     let bad_reflector = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &bad_reflector);
-    let too_narrow = ReflectorConfig {
+    let too_narrow = OracleFeedConfig {
         contract: reflector_id.clone(),
-        asset: Symbol::new(&env, "XLM"),
+        asset: polaris_ctf_math::sep40::Asset::Other(Symbol::new(&env, "XLM")),
         max_staleness_secs: REFLECTOR_RESOLUTION_SECS as u64 - 1, // narrower than resolution()
         tolerance_bps: REFLECTOR_TOLERANCE_BPS,
     };
     assert_eq!(
-        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128, &too_narrow),
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128, &too_narrow, &None),
         Err(Ok(Error::InvalidReflectorConfig)),
         "a staleness window narrower than Reflector's own update resolution must be rejected"
+    );
+
+    let bad_redstone = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &bad_redstone);
+    let redstone_id = env.register(mock_sep40::MockSep40, ());
+    let redstone_too_narrow = OracleFeedConfig {
+        contract: redstone_id.clone(),
+        asset: polaris_ctf_math::sep40::Asset::Stellar(Address::generate(&env)),
+        max_staleness_secs: REFLECTOR_RESOLUTION_SECS as u64 - 1,
+        tolerance_bps: REFLECTOR_TOLERANCE_BPS,
+    };
+    assert_eq!(
+        c.try_initialize(
+            &admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32,
+            &treasury, &1000i128, &reflector_config, &Some(redstone_too_narrow),
+        ),
+        Err(Ok(Error::InvalidRedstoneConfig)),
+        "same staleness-vs-resolution validation applies to an optionally-configured RedStone leg"
     );
 }
 
@@ -265,7 +377,7 @@ fn double_initialize_rejected() {
     let res = client.try_initialize(
         &h.admin, &h.token_id, &1_000_000i128, &h.expiry, &h.grace, &h.lazer_id,
         &FEED_ID, &100u32, &20u32, &h.treasury, &10_000i128,
-        &default_reflector_config(&h.env, &h.reflector_id),
+        &default_reflector_config(&h.env, &h.reflector_id), &None,
     );
     assert_eq!(res, Err(Ok(Error::AlreadyInitialized)));
 }
@@ -544,7 +656,7 @@ fn settle_rejects_a_stale_reflector_price() {
     let bytes = Bytes::from_slice(&h.env, &payload);
 
     let stale_ts = h.expiry - REFLECTOR_MAX_STALENESS_SECS - 1;
-    let reflector_client = mock_reflector::MockReflectorClient::new(&h.env, &h.reflector_id);
+    let reflector_client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
     reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &stale_ts);
 
     let res = client.try_settle(&bytes);
@@ -591,6 +703,125 @@ fn settle_accepts_a_small_divergence_within_tolerance() {
     set_reflector_price_cents(&h, 1_001_000); // $10,010.00 — 100bps apart, under the 150bps default
     client.settle(&bytes);
     assert_eq!(client.get_market().status, MarketStatus::ResolvedYes);
+}
+
+// ---------- on-chain RedStone cross-check (optional third leg) ----------
+
+#[test]
+fn market_with_no_redstone_leg_settles_exactly_as_before() {
+    // The regression bar this whole feature is built around: `setup` (no
+    // RedStone configured) must remain byte-identical to every one of the
+    // 32 pre-existing tests above — already proven by this file's full
+    // suite passing unmodified, but stated as its own explicit test too:
+    // `get_redstone_oracle` must read back `None`, and settlement must
+    // succeed on Reflector agreement alone, same as always.
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    assert_eq!(client.get_redstone_oracle(), None);
+
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
+    client.settle(&bytes);
+    assert_eq!(client.get_market().status, MarketStatus::ResolvedYes);
+}
+
+#[test]
+fn settle_succeeds_when_lazer_reflector_and_redstone_all_agree() {
+    let (h, redstone_id) = setup_with_redstone(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000); // $10,000.00
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h.env, &redstone_id, 1_000_000);
+    client.settle(&bytes);
+    assert_eq!(client.get_market().status, MarketStatus::ResolvedYes);
+}
+
+#[test]
+fn settle_rejects_on_redstone_divergence_even_when_reflector_agrees() {
+    // Unanimous, not majority: two-of-three agreeing (Lazer + Reflector)
+    // is not enough once a RedStone leg is configured — the whole point
+    // of adding a genuine third source rather than a looser quorum (see
+    // this repo's README for the UMA precedent this design deliberately
+    // avoids).
+    let (h, redstone_id) = setup_with_redstone(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000); // $10,000.00
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000); // agrees with Lazer
+    set_redstone_price_cents(&h.env, &redstone_id, 2_000_000); // $20,000.00 — way past 150bps
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::OracleDivergence)));
+    assert_eq!(client.get_market().status, MarketStatus::Open, "a divergence rejection must not finalize the market");
+
+    set_redstone_price_cents(&h.env, &redstone_id, 1_000_000); // corrected to agree
+    client.settle(&bytes);
+    assert_eq!(client.get_market().status, MarketStatus::ResolvedYes);
+}
+
+#[test]
+fn settle_rejects_when_redstone_has_no_price_yet() {
+    let (h, _redstone_id) = setup_with_redstone(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000); // Reflector agrees; RedStone never set
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::RedstonePriceUnavailable)));
+}
+
+#[test]
+fn settle_rejects_a_stale_redstone_price() {
+    let (h, redstone_id) = setup_with_redstone(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000);
+    let stale_ts = h.expiry - REFLECTOR_MAX_STALENESS_SECS - 1;
+    let redstone_client = mock_sep40::MockSep40Client::new(&h.env, &redstone_id);
+    redstone_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &stale_ts);
+
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::RedstonePriceStale)));
+}
+
+#[test]
+fn settle_rejects_when_redstones_decimals_drift_from_what_was_pinned_at_init() {
+    // The concrete landmine this design closes: RedStone's real Stellar
+    // SEP-40 wrapper documents, on-chain, that its `decimals()` returns
+    // the maximum precision across *every* asset it has registered, and
+    // can change if a higher-precision feed is added later (confirmed
+    // live against the real contract — see this repo's README). A naive
+    // "trust whatever decimals() returns right now" implementation would
+    // silently misinterpret RedStone's raw price the moment that changes.
+    // Pinning `decimals_at_init` and re-checking it on every `settle()`
+    // call turns that into this safe, detected rejection instead.
+    let (h, redstone_id) = setup_with_redstone(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h.env, &redstone_id, 1_000_000);
+    // Simulate RedStone's own admin registering a higher-precision feed on
+    // the same wrapper contract after this market's `initialize()` pinned
+    // `decimals_at_init` — nothing this contract did caused this.
+    mock_sep40::MockSep40Client::new(&h.env, &redstone_id).set_decimals(&(REFLECTOR_DECIMALS + 4));
+
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::RedstoneDecimalsChanged)));
+    assert_eq!(client.get_market().status, MarketStatus::Open);
 }
 
 // ---------- cancel (liveness backstop) ----------

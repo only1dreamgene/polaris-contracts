@@ -3,7 +3,7 @@ extern crate std;
 
 use super::*;
 use market_contract::Client as MarketClient;
-use market_contract::ReflectorConfig;
+use market_contract::OracleFeedConfig;
 use polaris_mock_lazer::MockLazer;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -226,12 +226,13 @@ fn redeem_from_market_collects_the_vaults_treasury_payout() {
         &20u32,
         &h.vault_id, // treasury = this vault, not a bare wallet
         &10_000i128,
-        &ReflectorConfig {
+        &OracleFeedConfig {
             contract: reflector_id.clone(),
-            asset: soroban_sdk::Symbol::new(&h.env, "XLM"),
+            asset: polaris_ctf_math::sep40::Asset::Other(soroban_sdk::Symbol::new(&h.env, "XLM")),
             max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
             tolerance_bps: REFLECTOR_TOLERANCE_BPS,
         },
+        &None, // no RedStone leg — this test exercises testnet-shaped behavior
     );
 
     // No trading — the simplest case: the market's entire pool (all of the

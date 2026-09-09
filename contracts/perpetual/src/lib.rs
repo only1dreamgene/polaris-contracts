@@ -72,8 +72,8 @@ use pyth_lazer_stellar_sdk::PythLazerClient;
 
 use polaris_ctf_math::{
     apply_fee, cpmm_out, cpmm_sell_out, effective_fee_bps as shared_effective_fee_bps,
-    reflector::{Asset, ReflectorPulseClient},
-    reflector_price_to_cents, to_cents, ReflectorConfig,
+    sep40::Sep40Client,
+    to_cents, verify_oracle_corroboration, OracleCheckError, OracleFeedConfig,
 };
 
 /// Protocol fee ceiling: 1000 bps = 10%. Same figure as `polaris-market`.
@@ -121,6 +121,24 @@ pub enum Error {
     ReflectorDecimalsInvalid = 22,
     OracleDivergence = 23,
     InvalidReflectorConfig = 24,
+    /// Reflector's live `decimals()` no longer matches the value pinned at
+    /// `initialize()` — see `polaris_ctf_math::OracleCheckError::DecimalsChanged`.
+    ReflectorDecimalsChanged = 25,
+    /// RedStone's `lastprice` returned `None` — same fail-closed treatment
+    /// as the Reflector leg. RedStone is a required part of the
+    /// `price_oracle` bundle whenever one is configured at all (see
+    /// `PriceOracleConfig`'s doc comment) — unlike `polaris-market`, where
+    /// it's independently optional, here it's all-or-nothing with Lazer +
+    /// Reflector.
+    RedstonePriceUnavailable = 26,
+    RedstonePriceStale = 27,
+    RedstoneDecimalsInvalid = 28,
+    /// See `Error::ReflectorDecimalsChanged` — the same landmine RedStone's
+    /// own SEP-40 wrapper contract documents on-chain (its `decimals()` is
+    /// the max across every asset it has registered, not this asset's own
+    /// precision, and can change): see this repo's README.
+    RedstoneDecimalsChanged = 29,
+    InvalidRedstoneConfig = 30,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,13 +168,29 @@ pub enum PerpetualStatus {
 /// the contract level (a perpetual market that never wants a checkpoint
 /// doesn't need to configure one), required as a whole if present (no
 /// half-configured state: either every field needed to verify a price is
-/// set, or none of them are).
+/// set, or none of them are). Unlike `polaris-market` (where RedStone is
+/// independently optional, since testnet has no RedStone deployment to
+/// point at), `redstone` here is required *whenever this bundle exists at
+/// all* — a perpetual market's checkpoint feature is opt-in as a whole
+/// unit already, so there's no separate "testnet needs checkpointing but
+/// can't have RedStone" case to accommodate the way `polaris-market`'s
+/// unconditionally-required Reflector leg does.
+///
+/// `reflector_decimals_at_init`/`redstone_decimals_at_init` are not
+/// caller-supplied — `initialize` overwrites whatever a caller passes with
+/// a live `decimals()` reading from each oracle, the same "fetched live,
+/// not trusted from input" treatment already used for `resolution()`. See
+/// `polaris_ctf_math::OracleCheckError::DecimalsChanged`'s doc comment for
+/// why this pinning exists at all.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub struct PriceOracleConfig {
     pub lazer_contract: Address,
     pub feed_id: u32,
-    pub reflector: ReflectorConfig,
+    pub reflector: OracleFeedConfig,
+    pub reflector_decimals_at_init: u32,
+    pub redstone: OracleFeedConfig,
+    pub redstone_decimals_at_init: u32,
 }
 
 #[derive(Clone)]
@@ -298,20 +332,39 @@ impl PolarisPerpetual {
             if oracle.feed_id == 0 {
                 return Err(Error::InvalidFeedId);
             }
-            // Same "a staleness window narrower than Reflector's own update
-            // cadence would reject every checkpoint outright" guard as
-            // polaris-market's initialize.
-            let reflector_resolution = ReflectorPulseClient::new(&env, &oracle.reflector.contract).resolution();
-            if oracle.reflector.max_staleness_secs < reflector_resolution as u64 {
+            // Same "a staleness window narrower than the oracle's own
+            // update cadence would reject every checkpoint outright" guard
+            // as polaris-market's initialize, applied to both legs — this
+            // bundle is all-or-nothing (see `PriceOracleConfig`'s doc
+            // comment), so both must validate for the whole thing to be
+            // accepted.
+            let reflector_client = Sep40Client::new(&env, &oracle.reflector.contract);
+            if oracle.reflector.max_staleness_secs < reflector_client.resolution() as u64 {
                 return Err(Error::InvalidReflectorConfig);
             }
+            let reflector_decimals_at_init = reflector_client.decimals();
+            if !(2..=30).contains(&reflector_decimals_at_init) {
+                return Err(Error::ReflectorDecimalsInvalid);
+            }
+
+            let redstone_client = Sep40Client::new(&env, &oracle.redstone.contract);
+            if oracle.redstone.max_staleness_secs < redstone_client.resolution() as u64 {
+                return Err(Error::InvalidRedstoneConfig);
+            }
+            let redstone_decimals_at_init = redstone_client.decimals();
+            if !(2..=30).contains(&redstone_decimals_at_init) {
+                return Err(Error::RedstoneDecimalsInvalid);
+            }
+
+            // Pinned live here, not trusted from the caller's own struct
+            // literal — see `PriceOracleConfig`'s doc comment.
+            env.storage().instance().set(
+                &DataKey::PriceOracle,
+                &PriceOracleConfig { reflector_decimals_at_init, redstone_decimals_at_init, ..oracle.clone() },
+            );
         }
 
         token::Client::new(&env, &collateral).transfer(&admin, &env.current_contract_address(), &initial_liquidity);
-
-        if let Some(oracle) = &price_oracle {
-            env.storage().instance().set(&DataKey::PriceOracle, oracle);
-        }
 
         let market = Perpetual {
             admin,
@@ -511,26 +564,25 @@ impl PolarisPerpetual {
 
         let final_cents = to_cents(price, exponent);
 
-        let reflector = ReflectorPulseClient::new(&env, &oracle.reflector.contract);
-        let reflector_price =
-            reflector.lastprice(&Asset::Other(oracle.reflector.asset.clone())).ok_or(Error::ReflectorPriceUnavailable)?;
-        if reflector_price.timestamp + oracle.reflector.max_staleness_secs < now {
-            return Err(Error::ReflectorPriceStale);
-        }
-        let reflector_decimals = reflector.decimals();
-        if !(2..=30).contains(&reflector_decimals) {
-            return Err(Error::ReflectorDecimalsInvalid);
-        }
-        let reflector_cents = reflector_price_to_cents(reflector_price.price, reflector_decimals);
-        let divergence = (final_cents - reflector_cents).abs();
-        let divergence_bps: i128 = if reflector_cents == 0 {
-            10_000
-        } else {
-            (divergence * 10_000) / reflector_cents.abs()
-        };
-        if divergence_bps > oracle.reflector.tolerance_bps as i128 {
-            return Err(Error::OracleDivergence);
-        }
+        // Unanimous dual corroboration — see the module doc and
+        // `PriceOracleConfig`'s doc comment. No mutation of `m` has
+        // happened yet, so every early return below is a clean revert.
+        verify_oracle_corroboration(&env, &oracle.reflector, oracle.reflector_decimals_at_init, now, final_cents)
+            .map_err(|e| match e {
+                OracleCheckError::Unavailable => Error::ReflectorPriceUnavailable,
+                OracleCheckError::Stale => Error::ReflectorPriceStale,
+                OracleCheckError::DecimalsInvalid => Error::ReflectorDecimalsInvalid,
+                OracleCheckError::DecimalsChanged => Error::ReflectorDecimalsChanged,
+                OracleCheckError::Divergent => Error::OracleDivergence,
+            })?;
+        verify_oracle_corroboration(&env, &oracle.redstone, oracle.redstone_decimals_at_init, now, final_cents)
+            .map_err(|e| match e {
+                OracleCheckError::Unavailable => Error::RedstonePriceUnavailable,
+                OracleCheckError::Stale => Error::RedstonePriceStale,
+                OracleCheckError::DecimalsInvalid => Error::RedstoneDecimalsInvalid,
+                OracleCheckError::DecimalsChanged => Error::RedstoneDecimalsChanged,
+                OracleCheckError::Divergent => Error::OracleDivergence,
+            })?;
 
         m.last_price_cents = final_cents;
         m.last_price_at = now;

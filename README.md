@@ -10,8 +10,8 @@ Seven crates, one workspace:
 
 | Crate | Purpose |
 |---|---|
-| `contracts/market` | The market contract. Source of truth for all funds and rules. `settle` requires a second, genuinely independent oracle (Reflector Network) to agree with Pyth Lazer on-chain before finalizing — see "On-chain second-oracle: Reflector Network" below. |
-| `contracts/ctf-math` | `rlib`-only shared crate — no `#[contract]`/`#[contractimpl]` — holding the pure CTF/AMM math (`cpmm_out`, `cpmm_sell_out`, `apply_fee`, the fee curve) and the Reflector Network client, extracted out of `contracts/market` so `contracts/perpetual` can reuse the exact same, already-audited implementations rather than a second hand-copied one. Safe as a normal dependency of both contracts: the wasm-symbol-collision hazard described in `contracts/vault`'s doc comment is specific to depending on a crate that itself exports a full `#[contract]` into the same wasm target, which this deliberately never does. |
+| `contracts/market` | The market contract. Source of truth for all funds and rules. `settle` requires a second, genuinely independent oracle (Reflector Network, optionally a third — RedStone) to agree with Pyth Lazer on-chain before finalizing — see "On-chain second-oracle: Reflector Network" and "A third oracle: RedStone" below. |
+| `contracts/ctf-math` | `rlib`-only shared crate — no `#[contract]`/`#[contractimpl]` — holding the pure CTF/AMM math (`cpmm_out`, `cpmm_sell_out`, `apply_fee`, the fee curve), the generic SEP-40 oracle client, and the shared corroboration-check logic (`verify_oracle_corroboration`) both contracts' `settle`/`record_price_checkpoint` call once per configured oracle leg. Extracted out of `contracts/market` so `contracts/perpetual` can reuse the exact same, already-audited implementations rather than a second hand-copied one. Safe as a normal dependency of `contracts/market`, `contracts/perpetual`, *and* `contracts/vault` (which needs `Asset` in scope for its `contractimport!`-generated bindings, not for any math): the wasm-symbol-collision hazard described in `contracts/vault`'s doc comment is specific to depending on a crate that itself exports a full `#[contract]` into the same wasm target, which this deliberately never does. |
 | `contracts/perpetual` | A no-expiry, no-leverage sibling to `contracts/market` — continuous trading with no forced terminal settlement. See "The perpetual contract" below. |
 | `contracts/mock-lazer` | Testnet-only stand-in for the real `pyth-lazer-stellar` verifier — echoes a payload back unverified so settlement can be exercised end-to-end without real Pyth signatures. **Never deploy to mainnet.** |
 | `contracts/smart-wallet` | A Soroban custom account contract authorized by a WebAuthn passkey (secp256r1) instead of a keypair — lets a passkey-backed address stand in anywhere a normal `Address` is expected, including as the market contract's `user`. |
@@ -342,20 +342,25 @@ returned a real, fresh price; `decimals()` is 14, `resolution()` is 300s
 `feed_update_timestamp` is microseconds, a unit mismatch this codebase has
 already been bitten by once, in the settlement-freshness check itself).
 
-**`ReflectorConfig`** (`initialize`'s 12th parameter, required, not
-optional — no two-tier trust model where some markets are N-of-2 and
-others silently aren't) bundles the four second-oracle settings into one
-`contracttype` struct rather than four more flat scalars — `initialize`
-was already at 11 positional args, and growing to 15 anonymous ones is
-exactly the kind of thing that let `base_fee_bps`/`min_fee_bps` almost get
-swapped at a call site once already:
+**`OracleFeedConfig`** (`initialize`'s 12th parameter for the Reflector
+leg, required, not optional — no two-tier trust model where some markets
+skip this leg and others silently don't) bundles the corroborating-oracle
+settings into one `contracttype` struct rather than four more flat
+scalars — `initialize` was already at 11 positional args, and growing to
+15+ anonymous ones is exactly the kind of thing that let
+`base_fee_bps`/`min_fee_bps` almost get swapped at a call site once
+already. Originally named `ReflectorConfig`; renamed once RedStone joined
+as a second, independent SEP-40 source using the exact same shape (see
+"A third oracle: RedStone" below) — one struct, reused per leg, not
+provider-specific:
 ```rust
-pub struct ReflectorConfig {
-    pub contract: Address,       // which Reflector oracle instance to read
-    pub asset: Symbol,           // e.g. "XLM" — this build is XLM-only,
-                                  // hardcoded to Asset::Other(...) in settle,
-                                  // same "one deliberate limitation, stated
-                                  // plainly" shape as the vault's fixed collateral
+pub struct OracleFeedConfig {
+    pub contract: Address,       // which oracle instance to read
+    pub asset: Asset,            // Stellar(Address) or Other(Symbol) — which
+                                  // variant a given provider expects varies
+                                  // (Reflector: Other("XLM"); RedStone:
+                                  // Stellar(<native XLM SAC>), confirmed live
+                                  // against each provider's real contract)
     pub max_staleness_secs: u64, // validated at initialize() against the
                                   // oracle's own live resolution() — can't be
                                   // configured narrower than the oracle updates
@@ -363,6 +368,9 @@ pub struct ReflectorConfig {
                                   // off-chain check's figure
 }
 ```
+This build is still XLM-only (see the vault's fixed-`collateral`
+precedent for this same "one deliberate limitation, stated plainly"
+shape) — only *which* `Asset` variant encodes that differs per provider.
 
 **Fails closed, not gracefully-degrades** — the opposite of the off-chain
 check's behavior, and deliberately so (see `lib.rs`'s module doc for the
@@ -377,21 +385,25 @@ get Reflector agreement cancels and refunds through the exact same
 well-tested path every other unresolvable market already uses — preserving
 "nobody unilaterally decides" even in the failure case.
 
-**Tests** (`contracts/market/src/test.rs`) use a stateful `mod
-mock_reflector` (unlike `mock_lazer`, which is stateless — divergence/
-staleness/unavailability tests need per-test-controlled return values),
-declared once in `contracts/ctf-math/src/lib.rs`'s `reflector` module and
-reused by the mock rather than redeclared, closing off an XDR-shape-drift
-trap: two independent declarations of a nominally-identical `contracttype`
-would each compile fine but produce mutually-incompatible wire encoding.
-Covers: agreement settles normally; a small in-tolerance divergence (real
-cross-path noise between two aggregations, not a data error) doesn't block
-settlement; a gross divergence rejects and leaves the market `Open`, then
-— concrete proof nothing is stranded, not just an assertion about it —
-correcting the mock price and re-calling `settle` succeeds normally; `None`
-and a stale timestamp both fail closed; and one explicit regression using
-the *exact same inputs* as `settle_yes_wins_on_price_at_or_above_strike`
-(which predates this feature) to prove a Lazer payload that used to settle
+**Tests** (`contracts/market/src/test.rs`) use a stateful `mod mock_sep40`
+(unlike `mock_lazer`, which is stateless — divergence/staleness/
+unavailability tests need per-test-controlled return values), a mock of
+the *generic* SEP-40 interface reused for both the Reflector and RedStone
+legs (two independent registered instances of the same mock — both real
+providers implement the identical interface, confirmed live for each).
+Its `Asset`/`PriceData` types come from `contracts/ctf-math/src/lib.rs`'s
+`sep40` module rather than being redeclared, closing off an
+XDR-shape-drift trap: two independent declarations of a
+nominally-identical `contracttype` would each compile fine but produce
+mutually-incompatible wire encoding. Covers: agreement settles normally; a
+small in-tolerance divergence (real cross-path noise between two
+aggregations, not a data error) doesn't block settlement; a gross
+divergence rejects and leaves the market `Open`, then — concrete proof
+nothing is stranded, not just an assertion about it — correcting the mock
+price and re-calling `settle` succeeds normally; `None` and a stale
+timestamp both fail closed; and one explicit regression using the *exact
+same inputs* as `settle_yes_wins_on_price_at_or_above_strike` (which
+predates this feature) to prove a Lazer payload that used to settle
 successfully now correctly gets rejected once Reflector disagrees with it.
 
 **This is a new contract version**, not a patch to already-deployed
@@ -399,6 +411,90 @@ instances — deployed wasm is immutable, so any market already live on the
 previous `initialize` signature keeps running exactly as it always has;
 only markets created after this ships get N-of-2 protection, same as every
 other contract change in this repo.
+
+## A third oracle: RedStone
+
+`settle`/`record_price_checkpoint` can optionally corroborate against a
+**third**, genuinely independent SEP-40 source — RedStone — on top of
+Reflector, closing the gap between "N-of-2" and real multi-provider
+redundancy. Design research (not just implementation) went into this
+before any code was written:
+
+- Of the candidate providers investigated (DIA, Band Protocol, Chainlink,
+  RedStone), RedStone is the only one with a real, live, queryable
+  SEP-40-compatible contract on Stellar today. Confirmed directly
+  on-chain, not from docs: reading
+  `CBMGLKUQZVSAIL5CPDDAWSUY7MAKXISHMOZEVLMBUWBMFGHRJSR4WYRF.lastprice(Asset::Stellar(<native XLM SAC>))`
+  on **mainnet** returned a genuinely fresh price (`18789745` @
+  `decimals()=8` → $0.18789745, timestamp within seconds of `date +%s` at
+  query time), matching Reflector's own testnet price to within noise.
+- **Unanimous, not majority.** A market configured with a `redstone` leg
+  requires *every* configured oracle to agree — any one disagreeing or
+  unavailable rejects the call, exactly like the Reflector leg already
+  does alone. This was a deliberate choice, not the default: Polymarket's
+  UMA optimistic oracle had an $85M dispute gamed via permissionless
+  quorum voting, and UMA's fix was to *restrict* its voter set rather than
+  broaden it — the industry pattern for binary-outcome oracle
+  agreement is "loosen the rule and it gets gamed," not "more sources is
+  strictly safer." A 2-of-3 majority would also mean an adversary only
+  needs to control the *same* two sources as today's N-of-2, gaining
+  nothing from the third source's presence; unanimous agreement is the
+  only rule where adding a genuinely independent third source actually
+  raises the bar.
+- **RedStone ships two different Stellar contracts** — this mattered for
+  which to integrate against. The one matching the existing SEP-40 client
+  shape (`lastprice`/`decimals`/`resolution`) — the wrapper above —
+  **admits, in its own on-chain help text, two deliberate deviations from
+  the SEP-40 spec**: `decimals()` returns the maximum precision across
+  *every* asset RedStone has registered on that contract, not XLM's own
+  precision, and can change if a higher-precision feed is added later;
+  `resolution()` is owner-mutable, not fixed. (RedStone's other contract,
+  a dedicated per-feed `redstone_price_feed-XLM`, has clean per-asset
+  `decimals()` but a completely different interface —
+  `read_price`/`read_timestamp` in **milliseconds**, no `resolution()` at
+  all.) The wrapper was chosen anyway — it reuses the existing client code
+  — with the specific landmine closed by a guard (`OracleCheckError::DecimalsChanged`,
+  in `contracts/ctf-math/src/lib.rs`'s `verify_oracle_corroboration`):
+  each leg's `decimals()` is fetched live exactly once, at `initialize()`,
+  and pinned; every later `settle()`/`record_price_checkpoint()` call
+  re-checks the live value against that pin and fails closed on any
+  drift, regardless of cause.
+- **RedStone's Stellar deployment is mainnet-only** — no testnet contract
+  exists (confirmed by listing RedStone's own
+  `deployments/stellarMultiFeed` directory in
+  `redstone-finance/redstone-oracles-monorepo`: every file is `.mainnet`,
+  none `.testnet`). This is why `contracts/market`'s `redstone` parameter
+  is `Option<OracleFeedConfig>` rather than required like `reflector` —
+  making it mandatory would silently break every testnet market this
+  project's own dev workflow depends on. This isn't a retreat from the
+  "no two-tier trust model" principle above (about not letting an admin
+  cheaply opt out of an equally-available check) — it's a structural fact
+  that RedStone isn't equally available everywhere yet, stated plainly.
+  `contracts/perpetual`'s checkpoint feature doesn't have this asymmetry:
+  it was already opt-in as a whole bundle, so `redstone` is a *required*
+  field of `PriceOracleConfig` whenever that bundle is configured at all —
+  no independent "Reflector-only" checkpoint configuration exists there.
+- **Live-verified this round**: the RedStone reads above (real mainnet
+  contract, real fresh price, correct `Asset::Stellar` encoding). **Not
+  live-verified**: a funded `settle()`/`record_price_checkpoint()` call
+  against real RedStone data end-to-end — that needs a real, funded
+  mainnet deployment, a separate and explicitly-authorized decision given
+  real financial exposure, not bundled into this round. The verification
+  logic itself is fully covered by unit tests against a mock (see below).
+
+**Tests**: `mod mock_sep40` is registered as two independent instances per
+test that needs both legs — the Reflector-shaped one and a RedStone-
+shaped one, same mock, since both real providers implement the same
+interface. New coverage on top of the existing Reflector tests: unanimous
+3-way agreement settles/checkpoints normally; a RedStone-only divergence
+rejects even when Reflector agrees (proving unanimous, not majority);
+RedStone unavailable/stale fail closed the same way Reflector's do; and
+the decimals-pin guard specifically — a mock RedStone that reports a
+different `decimals()` on a later call than the value observed at
+`initialize()` gets rejected with `RedstoneDecimalsChanged`, proving the
+landmine described above is actually closed. `contracts/market`'s
+existing 32 pre-RedStone tests (unconfigured `redstone: None`) all pass
+unmodified — the regression bar this whole feature is built around.
 
 ## The perpetual contract
 
@@ -494,8 +590,8 @@ for XLM/USD before going live.
 ## Building & testing
 
 ```sh
-# unit tests (native target; 73 across the whole workspace, 32 in
-# polaris-market, 18 in polaris-perpetual)
+# unit tests (native target; 83 across the whole workspace, 38 in
+# polaris-market, 22 in polaris-perpetual)
 cargo test --workspace
 
 # release WASM (requires `rustup target add wasm32v1-none`)
@@ -519,12 +615,12 @@ track whatever hash is actually uploaded):
 
 | Contract | Size | SHA-256 |
 |---|---|---|
-| `polaris_market.wasm` | 51,588 bytes | `6f9df2ebd1d4b98b5d4f021cdf1f2668717398e94fff582f870015a23be1b92c` |
-| `polaris_perpetual.wasm` | 53,285 bytes | `ec6c83dc0130d483aa62d831c8351de47f39c30180b2b8d60ce8650a801981e3` |
+| `polaris_market.wasm` | 57,533 bytes | `528299d3b3e6fddda42a31b89750233eabb019f1bed5465a682c1ac6109277a8` |
+| `polaris_perpetual.wasm` | 57,283 bytes | `275618bdb21d3445fdefdb67e32d1bc35dbd69e4bfa6f81a2def95b632fbac90` |
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
 | `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
 | `polaris_smart_wallet_factory.wasm` | 6,427 bytes | `c004f94b67dabab142804abc924cf28b0f159b3c4d4c18a3f26e017f642caf9e` |
-| `polaris_vault.wasm` | 10,568 bytes | `5847a7781556d7c4e727e63fe48a84d6bed9ff6c34686e6a0b09a03d3c925c3d` |
+| `polaris_vault.wasm` | 11,728 bytes | `0e2d253ffc0a064fe3d92e49774e79a82c39d61f203d4dea430b942cfb1000c0` |
 
 ## Deploying (needs the Stellar CLI, not available in this build environment)
 
@@ -536,5 +632,10 @@ stellar contract invoke --id <CONTRACT_ID> --source deployer --network testnet -
   --expiry <UNIX_TS> --grace_period 3600 --lazer_contract <LAZER_ID> \
   --feed_id 100 --base_fee_bps 100 --min_fee_bps 20 \
   --treasury <TREASURY> --initial_liquidity 10000000000 \
-  --reflector '{"contract":"CCYOZJCOPG34LLQQ7N24YXBM7LL62R7ONMZ3G6WZAAYPB5OYKOMJRN63","asset":"XLM","max_staleness_secs":600,"tolerance_bps":150}'
+  --reflector '{"contract":"CCYOZJCOPG34LLQQ7N24YXBM7LL62R7ONMZ3G6WZAAYPB5OYKOMJRN63","asset":{"Other":"XLM"},"max_staleness_secs":600,"tolerance_bps":150}' \
+  --redstone null
+# --redstone is optional (Option<OracleFeedConfig>) — omit/null on testnet,
+# where no RedStone contract exists yet (see "A third oracle: RedStone"
+# above). On mainnet, pass e.g.:
+#   --redstone '{"contract":"CBMGLKUQZVSAIL5CPDDAWSUY7MAKXISHMOZEVLMBUWBMFGHRJSR4WYRF","asset":{"Stellar":"<native XLM SAC>"},"max_staleness_secs":600,"tolerance_bps":150}'
 ```

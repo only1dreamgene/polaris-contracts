@@ -51,7 +51,6 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env,
-    Symbol,
 };
 
 use pyth_lazer_stellar_sdk::PythLazerClient;
@@ -62,8 +61,8 @@ use pyth_lazer_stellar_sdk::PythLazerClient;
 // this crate's full test suite after touching this file; every number
 // must come out identical).
 use polaris_ctf_math::{
-    apply_fee, cpmm_out, cpmm_sell_out, effective_fee_bps as shared_effective_fee_bps, reflector::{Asset, ReflectorPulseClient},
-    reflector_price_to_cents, to_cents, ReflectorConfig,
+    apply_fee, cpmm_out, cpmm_sell_out, effective_fee_bps as shared_effective_fee_bps, sep40::Sep40Client,
+    to_cents, verify_oracle_corroboration, OracleCheckError, OracleFeedConfig,
 };
 
 /// Protocol fee ceiling: 1000 bps = 10%.
@@ -120,6 +119,27 @@ pub enum Error {
     /// narrower than Reflector's own update `resolution()` — a window that
     /// could never realistically be met.
     InvalidReflectorConfig = 28,
+    /// Reflector's live `decimals()` no longer matches the value pinned at
+    /// `initialize()` — see `polaris_ctf_math::OracleCheckError::DecimalsChanged`.
+    ReflectorDecimalsChanged = 29,
+    /// RedStone's `lastprice` returned `None` for this market's asset —
+    /// same fail-closed treatment as the Reflector leg. Only reachable if
+    /// this market was configured with a `redstone` oracle at `initialize`.
+    RedstonePriceUnavailable = 30,
+    RedstonePriceStale = 31,
+    RedstoneDecimalsInvalid = 32,
+    /// RedStone's live `decimals()` no longer matches the value pinned at
+    /// `initialize()` — the specific landmine RedStone's own SEP-40
+    /// wrapper contract documents (its `decimals()` is the max across
+    /// *every* asset it has registered, not this asset's own precision,
+    /// and can change): see this repo's README for how this was found.
+    RedstoneDecimalsChanged = 33,
+    /// `initialize`-time validation for the `redstone` leg, mirroring
+    /// `InvalidReflectorConfig`. A RedStone-vs-Lazer divergence beyond
+    /// `redstone.tolerance_bps` reuses the shared `OracleDivergence`
+    /// variant above — unanimous, not majority: either leg disagreeing
+    /// rejects the call the same way.
+    InvalidRedstoneConfig = 34,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,10 +167,11 @@ pub enum MarketStatus {
     Cancelled,
 }
 
-// `ReflectorConfig` itself now lives in `polaris_ctf_math` (imported above)
-// — settle-time second-oracle settings, bundled into one struct rather than
-// four more flat `initialize()` scalars, shared verbatim with
-// `polaris-perpetual` since it means the same thing in both.
+// `OracleFeedConfig` itself now lives in `polaris_ctf_math` (imported
+// above) — settle-time corroborating-oracle settings, bundled into one
+// struct rather than four more flat `initialize()` scalars, shared
+// verbatim with `polaris-perpetual` and across both the Reflector and
+// RedStone legs, since it means the same thing for all of them.
 
 #[derive(Clone)]
 #[contracttype]
@@ -171,7 +192,27 @@ pub struct Market {
     pub pool_no: i128,
     pub total_supply: i128, // == total YES outstanding == total NO outstanding, pre-resolution
     pub initial_liquidity: i128, // immutable reference scale for the fee curve; total_supply >= this always, pre-resolution
-    pub reflector: ReflectorConfig,
+    pub reflector: OracleFeedConfig,
+    /// Reflector's `decimals()` as observed once, live, at `initialize()`
+    /// time — re-checked on every `settle()` call so a live drift fails
+    /// closed instead of silently corrupting the cents conversion. Plain
+    /// (non-`Option`) field: this leg is always configured, unlike
+    /// `redstone` below.
+    pub reflector_decimals_at_init: u32,
+}
+
+/// A configured RedStone corroboration leg plus the `decimals()` value
+/// observed, live, at `initialize()` time — bundled together since both
+/// are needed on every `settle()` call and neither is meaningful alone.
+/// Stored under its own `DataKey::Redstone` instance-storage entry rather
+/// than as an `Option<OracleFeedConfig>` field on `Market` itself: see
+/// this repo's README ("A soroban-sdk gotcha worth recording") for why
+/// `Option<CustomStruct>` can't be a `#[contracttype]` struct field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct RedstoneOracle {
+    pub config: OracleFeedConfig,
+    pub decimals_at_init: u32,
 }
 
 #[derive(Clone)]
@@ -179,6 +220,9 @@ pub struct Market {
 pub enum DataKey {
     Market,
     Balance(Prediction, Address),
+    /// Present only if this market was `initialize`d with a `redstone`
+    /// oracle configured — see `RedstoneOracle`'s doc comment.
+    Redstone,
 }
 
 fn touch(env: &Env) {
@@ -197,6 +241,10 @@ fn load_market(env: &Env) -> Result<Market, Error> {
 fn save_market(env: &Env, m: &Market) {
     env.storage().instance().set(&DataKey::Market, m);
     touch(env);
+}
+
+fn load_redstone_oracle(env: &Env) -> Option<RedstoneOracle> {
+    env.storage().instance().get(&DataKey::Redstone)
 }
 
 fn balance_of(env: &Env, side: Prediction, addr: &Address) -> i128 {
@@ -277,7 +325,15 @@ impl PolarisMarket {
         min_fee_bps: u32,
         treasury: Address,
         initial_liquidity: i128,
-        reflector: ReflectorConfig,
+        reflector: OracleFeedConfig,
+        // Genuinely independent of the same-shape `reflector` leg —
+        // RedStone's SEP-40 wrapper on Stellar (confirmed live, see this
+        // repo's README). `None` on testnet, where no RedStone contract
+        // exists yet — see `RedstoneOracle`'s doc comment for why this
+        // can't be a `Market` struct field. When present, corroboration
+        // is unanimous: this leg disagreeing rejects `settle()` exactly
+        // like the Reflector leg does, never a 2-of-3 majority.
+        redstone: Option<OracleFeedConfig>,
     ) -> Result<(), Error> {
         admin.require_auth();
 
@@ -305,9 +361,30 @@ impl PolarisMarket {
         // An admin can't configure a staleness window narrower than
         // Reflector's own update cadence allows — that would reject every
         // settle attempt outright, not just unlucky ones.
-        let reflector_resolution = ReflectorPulseClient::new(&env, &reflector.contract).resolution();
-        if reflector.max_staleness_secs < reflector_resolution as u64 {
+        let reflector_client = Sep40Client::new(&env, &reflector.contract);
+        if reflector.max_staleness_secs < reflector_client.resolution() as u64 {
             return Err(Error::InvalidReflectorConfig);
+        }
+        // Pinned once here, re-checked on every `settle()` call — see
+        // `Market::reflector_decimals_at_init`'s doc comment.
+        let reflector_decimals_at_init = reflector_client.decimals();
+        if !(2..=30).contains(&reflector_decimals_at_init) {
+            return Err(Error::ReflectorDecimalsInvalid);
+        }
+
+        if let Some(cfg) = &redstone {
+            let redstone_client = Sep40Client::new(&env, &cfg.contract);
+            if cfg.max_staleness_secs < redstone_client.resolution() as u64 {
+                return Err(Error::InvalidRedstoneConfig);
+            }
+            let redstone_decimals_at_init = redstone_client.decimals();
+            if !(2..=30).contains(&redstone_decimals_at_init) {
+                return Err(Error::RedstoneDecimalsInvalid);
+            }
+            env.storage().instance().set(
+                &DataKey::Redstone,
+                &RedstoneOracle { config: cfg.clone(), decimals_at_init: redstone_decimals_at_init },
+            );
         }
 
         token::Client::new(&env, &collateral).transfer(
@@ -329,6 +406,7 @@ impl PolarisMarket {
             treasury,
             status: MarketStatus::Open,
             reflector,
+            reflector_decimals_at_init,
             final_price: 0,
             pool_yes: initial_liquidity,
             pool_no: initial_liquidity,
@@ -572,31 +650,30 @@ impl PolarisMarket {
 
         let final_cents = to_cents(price, exponent);
 
-        // On-chain second-oracle enforcement — see the module doc's "why
-        // fail closed" section. No mutation of `m` has happened yet at
-        // this point, so every early return below is a clean revert.
-        let reflector = ReflectorPulseClient::new(&env, &m.reflector.contract);
-        let reflector_price = reflector
-            .lastprice(&Asset::Other(m.reflector.asset.clone()))
-            .ok_or(Error::ReflectorPriceUnavailable)?;
-        if reflector_price.timestamp + m.reflector.max_staleness_secs < now {
-            return Err(Error::ReflectorPriceStale);
-        }
-        let reflector_decimals = reflector.decimals();
-        if !(2..=30).contains(&reflector_decimals) {
-            return Err(Error::ReflectorDecimalsInvalid);
-        }
-        let reflector_cents = reflector_price_to_cents(reflector_price.price, reflector_decimals);
-        let divergence = (final_cents - reflector_cents).abs();
-        let divergence_bps: i128 = if reflector_cents == 0 {
-            // Zero is invalid data, not a valid comparison point — treat as
-            // maximal divergence rather than divide by zero.
-            10_000
-        } else {
-            (divergence * 10_000) / reflector_cents.abs()
-        };
-        if divergence_bps > m.reflector.tolerance_bps as i128 {
-            return Err(Error::OracleDivergence);
+        // On-chain second- (and, if configured, third-) oracle enforcement
+        // — see the module doc's "why fail closed" section. No mutation of
+        // `m` has happened yet at this point, so every early return below
+        // is a clean revert. Unanimous: any configured leg disagreeing or
+        // unavailable rejects the whole call, never a majority vote.
+        verify_oracle_corroboration(&env, &m.reflector, m.reflector_decimals_at_init, now, final_cents).map_err(
+            |e| match e {
+                OracleCheckError::Unavailable => Error::ReflectorPriceUnavailable,
+                OracleCheckError::Stale => Error::ReflectorPriceStale,
+                OracleCheckError::DecimalsInvalid => Error::ReflectorDecimalsInvalid,
+                OracleCheckError::DecimalsChanged => Error::ReflectorDecimalsChanged,
+                OracleCheckError::Divergent => Error::OracleDivergence,
+            },
+        )?;
+        if let Some(redstone) = load_redstone_oracle(&env) {
+            verify_oracle_corroboration(&env, &redstone.config, redstone.decimals_at_init, now, final_cents).map_err(
+                |e| match e {
+                    OracleCheckError::Unavailable => Error::RedstonePriceUnavailable,
+                    OracleCheckError::Stale => Error::RedstonePriceStale,
+                    OracleCheckError::DecimalsInvalid => Error::RedstoneDecimalsInvalid,
+                    OracleCheckError::DecimalsChanged => Error::RedstoneDecimalsChanged,
+                    OracleCheckError::Divergent => Error::OracleDivergence,
+                },
+            )?;
         }
 
         m.final_price = final_cents;
@@ -703,6 +780,13 @@ impl PolarisMarket {
 
     pub fn get_market(env: Env) -> Result<Market, Error> {
         load_market(&env)
+    }
+
+    /// `None` if this market was never configured with a RedStone leg —
+    /// see `RedstoneOracle`'s doc comment for why this lives outside
+    /// `Market` itself.
+    pub fn get_redstone_oracle(env: Env) -> Option<RedstoneOracle> {
+        load_redstone_oracle(&env)
     }
 
     pub fn get_position(env: Env, addr: Address) -> (i128, i128) {
