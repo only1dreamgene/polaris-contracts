@@ -145,7 +145,7 @@ mod mock_reflector {
     // identity — see `reflector.rs`'s module doc) — but reuses its `Asset`/
     // `PriceData` types via `super::` rather than redeclaring them, closing
     // off the XDR-shape-drift trap that redeclaring would open.
-    use super::reflector::{Asset, PriceData};
+    use polaris_ctf_math::reflector::{Asset, PriceData};
     use soroban_sdk::{contract, contractimpl, symbol_short, Env};
 
     const PRICE_KEY: soroban_sdk::Symbol = symbol_short!("px");

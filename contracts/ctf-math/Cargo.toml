@@ -1,0 +1,21 @@
+[package]
+name = "polaris-ctf-math"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+# rlib only, deliberately — no `#[contract]`/`#[contractimpl]` anywhere in
+# this crate, so it exports nothing into any consumer's wasm. That's what
+# makes it safe to depend on normally (not just as a dev-dependency) from
+# both polaris-market and polaris-perpetual: the wasm-symbol-collision
+# hazard documented in polaris-vault's Cargo.toml is specific to depending
+# on a crate that itself carries a `#[contract]` into the same wasm target
+# — sharing plain math has no such hazard.
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

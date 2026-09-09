@@ -56,8 +56,15 @@ use soroban_sdk::{
 
 use pyth_lazer_stellar_sdk::PythLazerClient;
 
-mod reflector;
-use reflector::{Asset, ReflectorPulseClient};
+// See polaris-ctf-math's module doc: the CPMM/fee-curve math and the
+// Reflector client are shared verbatim with polaris-perpetual now, not
+// carried inline here — a pure, behavior-preserving extraction (re-run
+// this crate's full test suite after touching this file; every number
+// must come out identical).
+use polaris_ctf_math::{
+    apply_fee, cpmm_out, cpmm_sell_out, effective_fee_bps as shared_effective_fee_bps, reflector::{Asset, ReflectorPulseClient},
+    reflector_price_to_cents, to_cents, ReflectorConfig,
+};
 
 /// Protocol fee ceiling: 1000 bps = 10%.
 const MAX_FEE_BPS: u32 = 1_000;
@@ -140,25 +147,10 @@ pub enum MarketStatus {
     Cancelled,
 }
 
-/// Settle-time second-oracle settings, bundled into one struct rather than
-/// four more flat `initialize()` scalars — `initialize` was already at 11
-/// positional args, and this codebase has already hit the "two adjacent
-/// same-typed params silently swapped" mistake once (see
-/// `base_fee_bps`/`min_fee_bps`); a named struct is safer than growing to
-/// 15 anonymous ones. Required, not `Option` — no two-tier trust model
-/// where some markets are N-of-2 and others silently aren't.
-#[derive(Clone)]
-#[contracttype]
-pub struct ReflectorConfig {
-    pub contract: Address,
-    /// This system is XLM-only today; hardcoded to `Asset::Other(...)` in
-    /// `settle` (see the vault's fixed-`collateral` precedent for this
-    /// same "one deliberate limitation, stated plainly" shape) rather than
-    /// also storing which `Asset` variant to construct.
-    pub asset: Symbol,
-    pub max_staleness_secs: u64,
-    pub tolerance_bps: u32,
-}
+// `ReflectorConfig` itself now lives in `polaris_ctf_math` (imported above)
+// — settle-time second-oracle settings, bundled into one struct rather than
+// four more flat `initialize()` scalars, shared verbatim with
+// `polaris-perpetual` since it means the same thing in both.
 
 #[derive(Clone)]
 #[contracttype]
@@ -240,104 +232,16 @@ fn debit(env: &Env, side: Prediction, addr: &Address, amount: i128) -> Result<()
     Ok(())
 }
 
-/// amount_out for a constant-product swap of `amount_in` (post-fee) against
-/// reserves (reserve_in, reserve_out). Floors, per Soroban i128 division.
-fn cpmm_out(reserve_in: i128, reserve_out: i128, effective_in: i128) -> i128 {
-    let k = reserve_in * reserve_out;
-    let new_reserve_in = reserve_in + effective_in;
-    let new_reserve_out = k / new_reserve_in;
-    reserve_out - new_reserve_out
-}
+// cpmm_out/isqrt/cpmm_sell_out/apply_fee/to_cents/reflector_price_to_cents
+// now live in polaris_ctf_math (imported above), shared verbatim with
+// polaris-perpetual — see that crate's doc comment.
 
-/// Floor integer square root via Newton's method (`n` assumed >= 0).
-fn isqrt(n: i128) -> i128 {
-    if n < 2 {
-        return n;
-    }
-    let mut x = n;
-    let mut y = (x + 1) / 2;
-    while y < x {
-        x = y;
-        y = (x + n / x) / 2;
-    }
-    x
-}
-
-/// Collateral payout for selling `effective_in` (post-fee) `prediction`
-/// shares straight to collateral in one call.
-///
-/// A naive "swap then merge" sell breaks whenever a user swaps away an
-/// *entire* one-sided position: they end up holding pure opposite-side
-/// shares with nothing left to merge against, and the trade silently
-/// returns zero collateral. This solves the constant-product invariant
-/// directly for the payout instead: find `x` (collateral out) such that
-/// merging `x` of both sides out of the pool, after `effective_in` shares
-/// were swapped in, preserves `k`:
-///   (reserve_in + effective_in - x) * (reserve_out - x) == reserve_in * reserve_out
-/// which is the quadratic `x^2 - x*S + P = 0` with `S = reserve_in +
-/// effective_in + reserve_out`, `P = effective_in * reserve_out`; the
-/// economically valid root is the smaller one, `x = (S - sqrt(S^2 - 4P)) / 2`.
-/// This is the standard FPMM "sell" formula (as used by Gnosis's
-/// conditional-token market makers), not something bespoke to this build.
-fn cpmm_sell_out(reserve_in: i128, reserve_out: i128, effective_in: i128) -> i128 {
-    let s = reserve_in + effective_in + reserve_out;
-    let p = effective_in * reserve_out;
-    let disc = s * s - 4 * p;
-    let sqrt_disc = isqrt(core::cmp::max(disc, 0));
-    (s - sqrt_disc) / 2
-}
-
-fn apply_fee(amount: i128, fee_bps: u32) -> i128 {
-    let fee = amount * fee_bps as i128 / 10_000;
-    amount - fee
-}
-
-/// Cost-driven fee curve: `base_fee_bps` at zero volume (`total_supply ==
-/// initial_liquidity`), decaying toward `min_fee_bps` as `total_supply`
-/// grows — the same "the more it's used, the cheaper it gets" shape as a
-/// marginal-cost-based repricing curve, computed automatically per trade
-/// rather than set by hand.
-///
-/// `effective = min + (base - min) * initial_liquidity / total_supply`.
-/// Well-defined and bounded to `[min_fee_bps, base_fee_bps]` because
-/// `total_supply >= initial_liquidity` is a standing invariant while a
-/// market is Open (every `merge`/`sell`/`redeem` can only unwind collateral
-/// that `split`/`buy` actually locked; the admin's own seed liquidity is
-/// never itself withdrawable pre-resolution — see the pool-to-treasury
-/// credit in `settle`/`cancel`), so the ratio is always in `(0, 1]`.
+/// Thin wrapper preserving this file's existing `effective_fee_bps(&m)`
+/// call sites unchanged — the actual curve is
+/// `polaris_ctf_math::effective_fee_bps`, which takes plain scalars so
+/// `polaris-perpetual` (a differently-shaped state struct) can share it too.
 fn effective_fee_bps(m: &Market) -> u32 {
-    let base = m.base_fee_bps as i128;
-    let min = m.min_fee_bps as i128;
-    let scaled = min + (base - min) * m.initial_liquidity / m.total_supply;
-    scaled as u32
-}
-
-/// Converts a Pyth raw price (`price * 10^exponent` = USD) into integer
-/// cents (`USD * 100`), staying in integer math throughout.
-fn to_cents(price: i64, exponent: i16) -> i128 {
-    let p = price as i128;
-    let e = exponent as i32 + 2;
-    if e >= 0 {
-        p * 10i128.pow(e as u32)
-    } else {
-        p / 10i128.pow((-e) as u32)
-    }
-}
-
-/// Converts Reflector's `PriceData.price` (scaled by `decimals`, USD-based
-/// same as Lazer's `to_cents`) into whole cents, rounding to the nearest
-/// cent rather than truncating — a floor bias would skew every divergence
-/// comparison in one direction. `decimals` is bounds-checked by the caller
-/// before this is called (guards the `10^(decimals - 2)` scaling from
-/// overflow/underflow at the extremes).
-fn reflector_price_to_cents(price: i128, decimals: u32) -> i128 {
-    let divisor = 10i128.pow(decimals - 2);
-    let half = divisor / 2;
-    if price >= 0 {
-        (price + half) / divisor
-    } else {
-        -((-price + half) / divisor)
-    }
+    shared_effective_fee_bps(m.base_fee_bps, m.min_fee_bps, m.initial_liquidity, m.total_supply)
 }
 
 fn reserves(m: &Market, side: Prediction) -> (i128, i128) {

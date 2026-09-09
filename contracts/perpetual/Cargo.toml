@@ -1,5 +1,5 @@
 [package]
-name = "polaris-market"
+name = "polaris-perpetual"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -10,9 +10,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 soroban-sdk = { workspace = true }
 pyth-lazer-stellar-sdk = { workspace = true }
-# rlib-only, no #[contract] in it — safe as a normal (non-dev) dependency,
-# unlike a real Cargo dependency on a sibling *contract* crate would be.
-# See polaris-ctf-math/Cargo.toml's doc comment.
 polaris-ctf-math = { path = "../ctf-math" }
 
 [dev-dependencies]

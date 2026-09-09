@@ -6,11 +6,13 @@ Rust / Soroban smart contracts for **Polaris** — a fully-collateralized,
 non-custodial binary prediction market on XLM/USD, settled by a Pyth Lazer
 price update verified on-chain.
 
-Five contracts, one workspace:
+Seven crates, one workspace:
 
 | Crate | Purpose |
 |---|---|
 | `contracts/market` | The market contract. Source of truth for all funds and rules. `settle` requires a second, genuinely independent oracle (Reflector Network) to agree with Pyth Lazer on-chain before finalizing — see "On-chain second-oracle: Reflector Network" below. |
+| `contracts/ctf-math` | `rlib`-only shared crate — no `#[contract]`/`#[contractimpl]` — holding the pure CTF/AMM math (`cpmm_out`, `cpmm_sell_out`, `apply_fee`, the fee curve) and the Reflector Network client, extracted out of `contracts/market` so `contracts/perpetual` can reuse the exact same, already-audited implementations rather than a second hand-copied one. Safe as a normal dependency of both contracts: the wasm-symbol-collision hazard described in `contracts/vault`'s doc comment is specific to depending on a crate that itself exports a full `#[contract]` into the same wasm target, which this deliberately never does. |
+| `contracts/perpetual` | A no-expiry, no-leverage sibling to `contracts/market` — continuous trading with no forced terminal settlement. See "The perpetual contract" below. |
 | `contracts/mock-lazer` | Testnet-only stand-in for the real `pyth-lazer-stellar` verifier — echoes a payload back unverified so settlement can be exercised end-to-end without real Pyth signatures. **Never deploy to mainnet.** |
 | `contracts/smart-wallet` | A Soroban custom account contract authorized by a WebAuthn passkey (secp256r1) instead of a keypair — lets a passkey-backed address stand in anywhere a normal `Address` is expected, including as the market contract's `user`. |
 | `contracts/smart-wallet-factory` | Deploys + initializes a `smart-wallet` instance in one atomic call, at a deterministic address derived from the passkey's public key. |
@@ -378,10 +380,10 @@ well-tested path every other unresolvable market already uses — preserving
 **Tests** (`contracts/market/src/test.rs`) use a stateful `mod
 mock_reflector` (unlike `mock_lazer`, which is stateless — divergence/
 staleness/unavailability tests need per-test-controlled return values),
-declared once in `contracts/market/src/reflector.rs` and reused by the
-mock rather than redeclared, closing off an XDR-shape-drift trap: two
-independent declarations of a nominally-identical `contracttype` would
-each compile fine but produce mutually-incompatible wire encoding.
+declared once in `contracts/ctf-math/src/lib.rs`'s `reflector` module and
+reused by the mock rather than redeclared, closing off an XDR-shape-drift
+trap: two independent declarations of a nominally-identical `contracttype`
+would each compile fine but produce mutually-incompatible wire encoding.
 Covers: agreement settles normally; a small in-tolerance divergence (real
 cross-path noise between two aggregations, not a data error) doesn't block
 settlement; a gross divergence rejects and leaves the market `Open`, then
@@ -398,6 +400,90 @@ previous `initialize` signature keeps running exactly as it always has;
 only markets created after this ships get N-of-2 protection, same as every
 other contract change in this repo.
 
+## The perpetual contract
+
+`contracts/perpetual` started as a request for crypto-perpetual-futures
+mechanics — margin, leverage, funding payments against a reference price.
+That design was rejected in two stages before any of `contracts/perpetual`
+was written, both recorded in the contract's own module doc rather than
+silently dropped:
+
+1. A paper (arXiv 2605.10400, "Resolution-Aware Perpetual Futures on
+   Binary Prediction Markets") proves that any
+   leverage `L > 1` applied to a binary 0/1-payout claim creates a
+   *structural, guaranteed* insolvency mode on the adverse outcome, and
+   that real mitigations (dynamic margin, leverage compression, staged
+   halts) don't reliably fix it against real Polymarket price data. So:
+   no margin, no leverage, ever, here — every position is fully
+   collateralized 1:1 at every instant, identical in spirit to
+   `contracts/market`'s own invariant.
+2. A fully-collateralized attempt at "funding" (transferring a bounded
+   fraction of the losing side's AMM pool to the winning side's pool each
+   period) was designed, then found — by adversarial review, with a
+   concrete numeric counterexample — to break the actual conservation
+   invariant this codebase depends on everywhere else: `pool_yes`/
+   `pool_no` are two **independent** share ledgers, each of which must
+   satisfy `pool_side + Σ(balances_side) == total_supply` on its own.
+   Editing both pool totals without a matching balance/`total_supply`
+   change manufactures unbacked claims on one side and destroys real
+   backing on the other — the same bug *class* as the cancellation-payout
+   double-count this contract's `redeem` doc comment warns about, a
+   different code path. The honest fix (lazy, cumulative-index funding
+   accrual) is itself a well-known bug-prone pattern (rebasing-token
+   accounting) that would need its own dedicated review round — dropped
+   rather than shipped half-trusted.
+
+**What shipped instead**: no fixed expiry, and continuous exit liquidity
+via the same already-audited `buy`/`sell` mechanics as `contracts/market`
+(reused verbatim from `contracts/ctf-math`, not reimplemented) — a holder
+never waits for a terminal event to realize a price move, they just
+`sell()` at the current AMM-implied price, any time. The anchor to reality
+is organic arbitrage, the same mechanism Polymarket itself already relies
+on with no funding rate at all.
+
+- `initialize` takes no `strike_price`/`expiry`/`grace_period` — `status`
+  starts `Open` and, under normal operation, never leaves it.
+- `record_price_checkpoint(payload)` is permissionless and reuses the
+  exact dual-oracle (Lazer + Reflector) verification `settle` uses, but
+  has **zero economic effect** — it only records `last_price_cents`/
+  `last_price_at` for observability. No pool, balance, or `total_supply`
+  mutation, ever; a dedicated test (`checkpoint_records_price_and_changes_nothing_else`)
+  asserts every other field is byte-identical before and after a real
+  checkpoint call.
+- `terminate(admin)` is the admin-gated wind-down safety valve — stated
+  explicitly as v1 scope (single admin, same convention as the vault's own
+  "not fractional LP shares yet"). A perpetual market has no strike price,
+  so there's nothing to resolve YES/NO *against*; `terminate` reuses
+  `contracts/market`'s already-audited `Cancelled`-redemption treatment
+  exactly instead — every complementary YES+NO pair is worth 0.5
+  collateral each, the only per-holder formula guaranteed solvent
+  regardless of trading history — which needs **no oracle call at all**.
+  `status` only ever has two values, `Open`/`Terminated`.
+- `trading_continues_correctly_across_a_very_long_time_window_with_no_expiry_ever_set`
+  advances the ledger timestamp by a full simulated year mid-test, then
+  keeps trading — proving "no fixed expiry" is genuinely absent from every
+  gate, not just an unenforced field.
+
+**A soroban-sdk gotcha worth recording**: the natural first draft stored
+the optional oracle config as a `price_oracle: Option<PriceOracleConfig>`
+field directly on the contract's main `#[contracttype]` struct. That fails
+to compile — but only under `cargo test`, not a plain release build, which
+made it briefly confusing. Reason: soroban-sdk 26.1's `#[contracttype]`
+macro generates each struct field's XDR (`ScVal`) conversion via a
+fallible `TryFrom<&FieldType>`, but `Option<T>`'s only route to `ScVal` is
+a blanket `From<Option<T>>` impl requiring an *infallible* `T:
+Into<ScVal>` — which a custom struct's generated (fallible) conversion
+never satisfies. That `ScVal` codegen path is itself gated behind
+soroban-sdk's `testutils` feature, which a `cargo test` build always
+enables via Cargo's feature unification even though it's only ever a
+dev-dependency — hence "compiles in release, fails in test." Fix: store
+the optional config under its own separate instance-storage key instead
+(`DataKey::PriceOracle`, read via a `get_price_oracle()` accessor) —
+storage's own `get()` returns `Option<T>` through the always-supported
+`Val`-level conversion, sidestepping the struct-field `ScVal` path
+entirely. Applies to any `#[contracttype]` struct with an `Option<CustomStruct>`
+field, not just this one.
+
 ## Feed ID
 
 `feed_id` is an `initialize` parameter, not hardcoded. For this build it
@@ -408,7 +494,8 @@ for XLM/USD before going live.
 ## Building & testing
 
 ```sh
-# unit tests (native target; 55 across the whole workspace, 32 in polaris-market alone)
+# unit tests (native target; 73 across the whole workspace, 32 in
+# polaris-market, 18 in polaris-perpetual)
 cargo test --workspace
 
 # release WASM (requires `rustup target add wasm32v1-none`)
@@ -417,9 +504,14 @@ cargo test --workspace
 # graph doesn't know about (see "The capital-efficiency vault" above).
 cargo build --release --target wasm32v1-none -p polaris-market
 cargo build --release --target wasm32v1-none -p polaris-mock-lazer \
-  -p polaris-smart-wallet -p polaris-smart-wallet-factory -p polaris-vault
+  -p polaris-smart-wallet -p polaris-smart-wallet-factory -p polaris-vault \
+  -p polaris-perpetual
 shasum -a 256 target/wasm32v1-none/release/*.wasm
 ```
+
+`contracts/ctf-math` produces no wasm of its own (`rlib` only, no
+`#[contract]`) — it's compiled into whichever of `polaris-market` /
+`polaris-perpetual` depend on it, not deployed independently.
 
 Current build (recorded here for reference — regenerate after any contract
 change; the backend's `MARKET_WASM_HASH` / mock-lazer deploy config must
@@ -427,10 +519,11 @@ track whatever hash is actually uploaded):
 
 | Contract | Size | SHA-256 |
 |---|---|---|
-| `polaris_market.wasm` | 51,059 bytes | `0bf6b3abec01c4f27b0c85304f728e0750e5798263e157a3ac66b518cc0194c2` |
+| `polaris_market.wasm` | 51,588 bytes | `6f9df2ebd1d4b98b5d4f021cdf1f2668717398e94fff582f870015a23be1b92c` |
+| `polaris_perpetual.wasm` | 53,285 bytes | `ec6c83dc0130d483aa62d831c8351de47f39c30180b2b8d60ce8650a801981e3` |
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
 | `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
-| `polaris_smart_wallet_factory.wasm` | 6,427 bytes | `921a1e1dbf1b78b9928926cd0662e444feb480dc8f570d36b69509a55006e565` |
+| `polaris_smart_wallet_factory.wasm` | 6,427 bytes | `c004f94b67dabab142804abc924cf28b0f159b3c4d4c18a3f26e017f642caf9e` |
 | `polaris_vault.wasm` | 10,568 bytes | `5847a7781556d7c4e727e63fe48a84d6bed9ff6c34686e6a0b09a03d3c925c3d` |
 
 ## Deploying (needs the Stellar CLI, not available in this build environment)
