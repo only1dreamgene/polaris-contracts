@@ -228,7 +228,7 @@ fn redeem_from_market_collects_the_vaults_treasury_payout() {
         &10_000i128,
         &OracleFeedConfig {
             contract: reflector_id.clone(),
-            asset: polaris_ctf_math::sep40::Asset::Other(soroban_sdk::Symbol::new(&h.env, "XLM")),
+            asset: market_contract::Asset::Other(soroban_sdk::Symbol::new(&h.env, "XLM")),
             max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
             tolerance_bps: REFLECTOR_TOLERANCE_BPS,
         },

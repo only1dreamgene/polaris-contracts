@@ -580,6 +580,34 @@ storage's own `get()` returns `Option<T>` through the always-supported
 entirely. Applies to any `#[contracttype]` struct with an `Option<CustomStruct>`
 field, not just this one.
 
+## A second soroban-sdk gotcha: `export = false` can hide a type entirely
+
+Found integrating `polaris-oracle` against the RedStone-updated contracts:
+`sep40::Asset` (in `contracts/ctf-math/src/lib.rs`) was declared
+`#[contracttype(export = false)]` from when it only ever described an
+*external* contract's call shape (Reflector/RedStone's `lastprice`) —
+suppressing its own top-level spec entry seemed right for a type that
+wasn't part of *this* contract's own interface. Once `Asset` became a
+genuine field of `OracleFeedConfig` (an `initialize` parameter), that
+stopped being true — but the compiled wasm still had no resolvable spec
+entry for it, confirmed live: both the `stellar` CLI's JSON arg parser and
+(by the same mechanism — `@stellar/stellar-sdk`'s `contract.Spec`, which
+`polaris-oracle` builds its Soroban calls from) any spec-driven encoder
+reject a value for that field with `Missing Entry Asset`, even given the
+exact correct shape (`{"Other":"XLM"}`/`{"Stellar":"<addr>"}`). This is
+different from the `#[contracttype]`/`testutils` gotcha above: that one
+only broke a `cargo test` build reading Rust source; this one broke every
+*non-Rust* caller (CLI, TypeScript SDK) of an otherwise-fully-working
+contract, silently, until something outside this repository tried to
+construct the value from JSON. Fix: plain `#[contracttype]` on `Asset`
+(dropped `export = false`) — confirmed live afterward, both the `Other`
+and `Stellar` variants parse and round-trip correctly through
+`get_market`/`get_redstone_oracle`. Rule of thumb: `export = false` is
+only safe for a type that will *never* need to be constructed from outside
+Rust source (a pure call-out shape) — the moment it becomes a field of any
+type in this contract's own `initialize`/public struct surface, it needs a
+real spec entry.
+
 ## Feed ID
 
 `feed_id` is an `initialize` parameter, not hardcoded. For this build it
@@ -615,12 +643,12 @@ track whatever hash is actually uploaded):
 
 | Contract | Size | SHA-256 |
 |---|---|---|
-| `polaris_market.wasm` | 57,533 bytes | `528299d3b3e6fddda42a31b89750233eabb019f1bed5465a682c1ac6109277a8` |
-| `polaris_perpetual.wasm` | 57,283 bytes | `275618bdb21d3445fdefdb67e32d1bc35dbd69e4bfa6f81a2def95b632fbac90` |
+| `polaris_market.wasm` | 57,617 bytes | `6c99075c91ed438833595bd032b8ec6024a1d638256504aa6c7c6837f01fa9fc` |
+| `polaris_perpetual.wasm` | 57,367 bytes | `b62909fa2c78b083a8973b7b733b0ce9e4b8cdb1efd1d0169f61c93370af9727` |
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
 | `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
 | `polaris_smart_wallet_factory.wasm` | 6,427 bytes | `c004f94b67dabab142804abc924cf28b0f159b3c4d4c18a3f26e017f642caf9e` |
-| `polaris_vault.wasm` | 11,728 bytes | `0e2d253ffc0a064fe3d92e49774e79a82c39d61f203d4dea430b942cfb1000c0` |
+| `polaris_vault.wasm` | 10,568 bytes | `5847a7781556d7c4e727e63fe48a84d6bed9ff6c34686e6a0b09a03d3c925c3d` |
 
 ## Deploying (needs the Stellar CLI, not available in this build environment)
 

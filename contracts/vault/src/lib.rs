@@ -55,15 +55,6 @@ use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, token, Ad
 /// dependency the top-level README already documents for wiring the
 /// compiled wasm into `polaris-oracle`.
 mod market_contract {
-    // `contractimport!`'s generated `OracleFeedConfig` references `Asset`
-    // by bare name rather than generating its own definition (its spec
-    // entry is `export = false` in `polaris_ctf_math`, the crate that
-    // actually declares it) — this brings the canonical declaration into
-    // scope so the macro's output resolves. See `Cargo.toml`'s comment on
-    // why depending on `polaris-ctf-math` here doesn't reintroduce the
-    // wasm-symbol-collision hazard this module's own doc comment warns
-    // about for a *real* contract crate.
-    use polaris_ctf_math::sep40::Asset;
     soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/polaris_market.wasm");
 }
 
