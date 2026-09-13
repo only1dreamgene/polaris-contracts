@@ -30,7 +30,7 @@ jobs:
       - name: Build the rest
         run: |
           cargo build --release --target wasm32v1-none \
-            -p polaris-mock-lazer -p polaris-smart-wallet \
+            -p polaris-mock-lazer -p polaris-mock-redstone -p polaris-smart-wallet \
             -p polaris-smart-wallet-factory -p polaris-vault -p polaris-perpetual
       - run: cargo test --workspace
 
@@ -56,5 +56,5 @@ jobs:
       - name: Build the rest
         run: |
           cargo build --release --target wasm32v1-none \
-            -p polaris-mock-lazer -p polaris-smart-wallet \
+            -p polaris-mock-lazer -p polaris-mock-redstone -p polaris-smart-wallet \
             -p polaris-smart-wallet-factory -p polaris-vault -p polaris-perpetual

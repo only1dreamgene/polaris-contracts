@@ -14,6 +14,7 @@ Seven crates, one workspace:
 | `contracts/ctf-math` | `rlib`-only shared crate — no `#[contract]`/`#[contractimpl]` — holding the pure CTF/AMM math (`cpmm_out`, `cpmm_sell_out`, `apply_fee`, the fee curve), the generic SEP-40 oracle client, and the shared corroboration-check logic (`verify_oracle_corroboration`) both contracts' `settle`/`record_price_checkpoint` call once per configured oracle leg. Extracted out of `contracts/market` so `contracts/perpetual` can reuse the exact same, already-audited implementations rather than a second hand-copied one. Safe as a normal dependency of `contracts/market`, `contracts/perpetual`, *and* `contracts/vault` (which needs `Asset` in scope for its `contractimport!`-generated bindings, not for any math): the wasm-symbol-collision hazard described in `contracts/vault`'s doc comment is specific to depending on a crate that itself exports a full `#[contract]` into the same wasm target, which this deliberately never does. |
 | `contracts/perpetual` | A no-expiry, no-leverage sibling to `contracts/market` — continuous trading with no forced terminal settlement. See "The perpetual contract" below. |
 | `contracts/mock-lazer` | Testnet-only stand-in for the real `pyth-lazer-stellar` verifier — echoes a payload back unverified so settlement can be exercised end-to-end without real Pyth signatures. **Never deploy to mainnet.** |
+| `contracts/mock-redstone` | Testnet-only stand-in for RedStone's real (mainnet-only) SEP-40 wrapper — see "A third oracle: RedStone" below for why `contracts/perpetual`'s `record_price_checkpoint` needs one to be exercisable on testnet at all. **Never deploy to mainnet.** |
 | `contracts/smart-wallet` | A Soroban custom account contract authorized by a WebAuthn passkey (secp256r1) instead of a keypair — lets a passkey-backed address stand in anywhere a normal `Address` is expected, including as the market contract's `user`. |
 | `contracts/smart-wallet-factory` | Deploys + initializes a `smart-wallet` instance in one atomic call, at a deterministic address derived from the passkey's public key. |
 | `contracts/vault` | Capital-efficiency vault — centralizes LP custody and accounting for market seed liquidity, funded once per depositor rather than fragmented per market. See "The capital-efficiency vault" below. |
@@ -481,6 +482,19 @@ before any code was written:
   mainnet deployment, a separate and explicitly-authorized decision given
   real financial exposure, not bundled into this round. The verification
   logic itself is fully covered by unit tests against a mock (see below).
+- **Follow-up round: `record_price_checkpoint` was genuinely unexercisable
+  on testnet at all**, not just unverified — `PriceOracleConfig`'s
+  `redstone` field being required-within-the-bundle (previous bullet)
+  means a perpetual's `price_oracle` can't be configured on testnet
+  without *some* contract standing in for RedStone. `contracts/mock-redstone`
+  (see its own row above) closes this the same way `contracts/mock-lazer`
+  already does for Pyth Lazer — a bare SEP-40-shaped mock, admin-poked via
+  `set_price`, wired into `polaris-oracle`'s perpetual deployment alongside
+  the real Reflector testnet oracle. `initialize()`'s own validation (the
+  staleness-vs-`resolution()` check, the decimals-pin) applies to this leg
+  exactly as it would to the real thing, so this genuinely exercises the
+  verification logic end-to-end, not just the parts that don't involve
+  RedStone.
 
 **Tests**: `mod mock_sep40` is registered as two independent instances per
 test that needs both legs — the Reflector-shaped one and a RedStone-
@@ -618,7 +632,7 @@ for XLM/USD before going live.
 ## Building & testing
 
 ```sh
-# unit tests (native target; 83 across the whole workspace, 38 in
+# unit tests (native target; 86 across the whole workspace, 38 in
 # polaris-market, 22 in polaris-perpetual)
 cargo test --workspace
 
@@ -628,8 +642,8 @@ cargo test --workspace
 # graph doesn't know about (see "The capital-efficiency vault" above).
 cargo build --release --target wasm32v1-none -p polaris-market
 cargo build --release --target wasm32v1-none -p polaris-mock-lazer \
-  -p polaris-smart-wallet -p polaris-smart-wallet-factory -p polaris-vault \
-  -p polaris-perpetual
+  -p polaris-mock-redstone -p polaris-smart-wallet -p polaris-smart-wallet-factory \
+  -p polaris-vault -p polaris-perpetual
 shasum -a 256 target/wasm32v1-none/release/*.wasm
 ```
 
@@ -646,6 +660,7 @@ track whatever hash is actually uploaded):
 | `polaris_market.wasm` | 57,617 bytes | `6c99075c91ed438833595bd032b8ec6024a1d638256504aa6c7c6837f01fa9fc` |
 | `polaris_perpetual.wasm` | 57,367 bytes | `b62909fa2c78b083a8973b7b733b0ce9e4b8cdb1efd1d0169f61c93370af9727` |
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
+| `polaris_mock_redstone.wasm` | 7,280 bytes | `0db6ff0394999bb28e97a786c5b64891f341290aa323d8a8aec78b711eb28cdf` |
 | `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
 | `polaris_smart_wallet_factory.wasm` | 6,427 bytes | `c004f94b67dabab142804abc924cf28b0f159b3c4d4c18a3f26e017f642caf9e` |
 | `polaris_vault.wasm` | 10,568 bytes | `5847a7781556d7c4e727e63fe48a84d6bed9ff6c34686e6a0b09a03d3c925c3d` |

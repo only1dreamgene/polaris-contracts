@@ -1,0 +1,18 @@
+[package]
+name = "polaris-mock-redstone"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+# For the sep40::Asset/PriceData types only (same canonical declaration
+# every real leg uses) — safe as a normal dependency, no #[contract] in
+# ctf-math to collide with this crate's own wasm export symbols.
+polaris-ctf-math = { path = "../ctf-math" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
