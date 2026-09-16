@@ -52,6 +52,7 @@ app is at
 - [Engineering notes: soroban-sdk gotchas](#engineering-notes-soroban-sdk-gotchas)
 - [Building & testing](#building--testing)
 - [Deploying](#deploying)
+- [Contributing](#contributing)
 
 ## Architecture
 
@@ -526,6 +527,13 @@ stellar contract invoke --id <CONTRACT_ID> --source deployer --network testnet -
 In practice, `polaris-oracle`'s `POST /markets/create` and
 `POST /perpetuals/create` do this deploy+initialize sequence for you against
 the wasm files already checked into that repo — see its README.
+
+## Contributing
+
+Peer review and testing are the most effective way to contribute to a
+project this size — see [CONTRIBUTING.md](./CONTRIBUTING.md) for the full
+process (adapted from Bitcoin Core's), including the higher review bar
+that applies to fund-safety-critical code.
 
 ## License
 
